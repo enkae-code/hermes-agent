@@ -638,7 +638,7 @@ class SearchMixin:
                 glob_expr_probe = f"{glob_expr} {self._search_prune_glob_args()}"
             else:
                 glob_expr_probe = glob_expr
-            probe_words = [rg, flags, "--count-matches", glob_expr_probe,
+            probe_words = [rg, flags, "--count-matches", glob_expr_probe, "--",
                            self._escape_shell_arg(pattern, translate_path=False), self._escape_native_tool_arg(path)]
             probe = self._run_rg_bounded(probe_words, 50, timeout=30)
             total, per_file = 0, []
@@ -1067,7 +1067,7 @@ class SearchMixin:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             cmd_parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        cmd_parts.append(self._escape_shell_arg(pattern, translate_path=False))
+        cmd_parts.extend(["--", self._escape_shell_arg(pattern, translate_path=False)])
         # rg is a native Windows binary (winget/cargo/choco): needs C:/... not MSYS /c/...
         cmd_parts.append(self._escape_native_tool_arg(path))
         ml_note = (
@@ -1086,7 +1086,7 @@ class SearchMixin:
             parts.extend(["--include", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        parts.append(self._escape_shell_arg(pattern, translate_path=False))
+        parts.extend(["--", self._escape_shell_arg(pattern, translate_path=False)])
         return parts
 
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
