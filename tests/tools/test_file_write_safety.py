@@ -796,7 +796,7 @@ class TestProtectedInstructionFiles:
         assert (work_dir / "work-order.md").read_text(encoding="utf-8") == "# order\n"
         assert approvals["calls"] == []
 
-    @pytest.mark.parametrize("name", ["config.yaml", ".env", "SOUL.md", "AGENTS.md"])
+    @pytest.mark.parametrize("name", ["config.yaml", ".env", "environment.json", "SOUL.md", "AGENTS.md"])
     def test_project_hermes_instruction_and_config_files_stay_gated(self, tmp_path, name):
         import tools.file_tools_write_guards as ft
         target = tmp_path / "repo" / ".hermes" / name

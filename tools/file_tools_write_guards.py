@@ -188,9 +188,10 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # probe common case variants too, so the stricter behavior is kept uniform.
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules"})
-# Files directly inside a project's ``.hermes`` dir that steer behavior; work orders and proof
+# Files directly inside a project's ``.hermes`` dir that steer behavior (environment.json holds
+# shell commands `hermes verify` runs); work orders and proof
 # files beside them stay writable.
-_PROJECT_HERMES_CONFIG_BASENAMES = frozenset({"config.yaml", ".env"})
+_PROJECT_HERMES_CONFIG_BASENAMES = frozenset({"config.yaml", ".env", "environment.json"})
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
