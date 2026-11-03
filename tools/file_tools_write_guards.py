@@ -188,6 +188,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # probe common case variants too, so the stricter behavior is kept uniform.
 _PROTECTED_INSTRUCTION_BASENAMES = frozenset({
     "agents.md", "claude.md", "soul.md", ".cursorrules"})
+# Files directly inside a project's ``.hermes`` dir that steer behavior; work orders and proof
+# files beside them stay writable.
+_PROJECT_HERMES_CONFIG_BASENAMES = frozenset({"config.yaml", ".env"})
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
@@ -244,11 +247,12 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
                 fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
             return base
-        # Project-local .hermes config dirs (<repo>/.hermes/config.yaml) steer
-        # behavior too. Only the IMMEDIATE parent counts — matching any ancestor
-        # would gate every write inside a checkout living under ~/.hermes.
+        # Project-local .hermes config (<repo>/.hermes/config.yaml, .env) steers behavior too.
+        # Only the IMMEDIATE parent counts — matching any ancestor would gate every write
+        # inside a checkout living under ~/.hermes.
         parts = candidate.replace("\\", "/").rstrip("/").split("/")
-        if len(parts) >= 2 and parts[-2] == ".hermes":
+        if (len(parts) >= 2 and parts[-2] == ".hermes"
+                and base_lower in _PROJECT_HERMES_CONFIG_BASENAMES):
             return candidate
     return None
 

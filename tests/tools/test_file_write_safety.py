@@ -787,6 +787,22 @@ class TestProtectedInstructionFiles:
         assert not res.get("error"), res
         assert approvals["calls"] == []
 
+    def test_project_hermes_work_order_is_writable(self, tmp_path, approvals):
+        """Work orders and proof files under <repo>/.hermes/ are not instruction files."""
+        work_dir = tmp_path / "repo" / ".hermes"
+        work_dir.mkdir(parents=True)
+        res = self._write(work_dir / "work-order.md", "# order\n")
+        assert not res.get("error"), res
+        assert (work_dir / "work-order.md").read_text(encoding="utf-8") == "# order\n"
+        assert approvals["calls"] == []
+
+    @pytest.mark.parametrize("name", ["config.yaml", ".env", "SOUL.md", "AGENTS.md"])
+    def test_project_hermes_instruction_and_config_files_stay_gated(self, tmp_path, name):
+        import tools.file_tools_write_guards as ft
+        target = tmp_path / "repo" / ".hermes" / name
+        assert ft._protected_instruction_reason(
+            str(target), enabled=True, extra_patterns=[]) is not None
+
     def test_real_hermes_home_not_gated_by_this_check(
         self, tmp_path, approvals, monkeypatch
     ):
