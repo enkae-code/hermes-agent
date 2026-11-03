@@ -293,6 +293,58 @@ async def test_post_turn_watch_drain_off_consumes_without_injecting(monkeypatch,
     assert completion_queue.get_nowait() is async_event
 
 
+class _RefuseFirstHandler(AsyncMock):
+    """Adapter that refuses the first insertion (no receipt) and accepts every later one."""
+
+    def __init__(self):
+        super().__init__()
+        self.accepted = []
+
+    async def _execute_mock_call(self, event, *args, **kwargs):
+        result = await super()._execute_mock_call(event, *args, **kwargs)
+        if len(self.await_args_list) > 1:
+            event._gateway_accepted = True
+            self.accepted.append(event)
+        return result
+
+
+@pytest.mark.asyncio
+async def test_refused_watch_event_is_accepted_exactly_once(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    handler = _RefuseFirstHandler()
+    runner.adapters[Platform.TELEGRAM].handle_message = handler
+    completion_queue = queue.Queue()
+    evt = {**_watch_event(), "event_id": "ev-refused-once"}
+    completion_queue.put(evt)
+
+    await runner._drain_watch_notifications(completion_queue)
+    requeued = completion_queue.get_nowait()
+    requeued["_watch_next_retry_at"] = 0.0
+    completion_queue.put(requeued)
+    await runner._drain_watch_notifications(completion_queue)
+    await runner._drain_watch_notifications(completion_queue)
+
+    assert handler.await_count == 2
+    assert len(handler.accepted) == 1
+    assert completion_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_accepted_watch_event_is_never_redelivered(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+    completion_queue = queue.Queue()
+    evt = {**_watch_event(), "event_id": "ev-accepted"}
+    completion_queue.put(evt)
+    await runner._drain_watch_notifications(completion_queue)
+
+    completion_queue.put(evt)  # the same accepted event re-enters the queue
+    await runner._drain_watch_notifications(completion_queue)
+
+    assert adapter.handle_message.await_count == 1
+    assert completion_queue.empty()
+
+
 @pytest.mark.asyncio
 async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource

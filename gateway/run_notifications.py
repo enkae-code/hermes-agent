@@ -726,6 +726,10 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 # instead of re-attempting admission every 2 s (#140899).
                 completion_queue.put(evt)
                 continue
+            # An accepted event re-entering the queue must not reach the agent again.
+            identity = self._completion_delivery_identity(evt)
+            if identity is not None and self._completion_identity_seen(identity):
+                continue
             async with self._completion_event_scope(evt):
                 from tools.process_registry_notifications import should_surface_notification
                 if not should_surface_notification(evt):
@@ -744,6 +748,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     except Exception:
                         logger.exception("Watch notification injection error")
                         delivered = False
+            if delivered is True and identity is not None:
+                with self._completion_delivery_lock:
+                    self._mark_completions_delivered_locked((identity,))
             # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
                 self._requeue_refused_watch_event(completion_queue, evt)
