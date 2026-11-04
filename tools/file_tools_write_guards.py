@@ -193,6 +193,15 @@ _PROTECTED_INSTRUCTION_BASENAMES = frozenset({"soul.md"})
 # shell commands `hermes verify` runs); work orders and proof
 # files beside them stay writable.
 _PROJECT_HERMES_CONFIG_BASENAMES = frozenset({"config.yaml", ".env", "environment.json"})
+# Per-tree entry cap for the loader-link scan. Past it, the scan fails closed (the write is gated).
+# ponytail: a full walk per write; cache by tree mtime if this gate shows up in profiles.
+_LINK_SCAN_CAP = 2000
+_UNVERIFIED_PROJECT_LINKS = ("project context paths could not be resolved or scanned for symlinks; "
+                             "approve only if this target is intended")
+
+
+class _LinkScanError(Exception):
+    """A project tree could not be walked completely, so its links cannot be ruled out."""
 
 
 def _prompt_loaded_names() -> tuple[frozenset[str], tuple[str, ...]]:
@@ -292,22 +301,63 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
 
 def _symlink_target(spelling: Path) -> str | None:
-    """Realpath of a protected spelling that is a symlink, or sits under one; ``None`` for plain paths
-    and for names that do not exist (a dangling link still counts: its target can be created)."""
-    if not os.path.lexists(spelling):
-        return None
+    """Realpath of a protected spelling that is a symlink or sits under one, else ``None``.
+
+    Nonexistent names count too: ``realpath`` resolves symlinked parents of a missing tail, so a
+    new file under a linked ``.hermes`` lands where the loader will read it."""
     real = os.path.realpath(spelling)
     return real if real != str(spelling) else None
 
 
-def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
-    """Gate a write that lands on the ordinary target of a loader-visible symlink.
+def _loader_linked_targets(top: str, max_parts: int | None, skill_tree: bool) -> list[tuple[str, str]]:
+    """``(name, realpath)`` for each symlink under *top* that a loader reads.
 
-    The loaders read the protected spellings in the task's project anchors (cwd and its
-    ancestors up to the git root) through symlinks, so writing the link's target changes
-    the file the loader reads. Only spellings that are or sit under a symlink are checked;
-    a plain spelling is already covered by the name and tree rules above.
+    Links are recorded, never followed: a linked dir's contents are caught by the realpath
+    containment check in the caller. ``max_parts`` bounds entry depth (plugins read at most three
+    levels); ``skill_tree`` applies the skill walk's pruning. Raises ``_LinkScanError`` past
+    ``_LINK_SCAN_CAP`` entries or on an unreadable directory.
     """
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
+
+    def unreadable(err: OSError) -> None:
+        raise _LinkScanError(str(err))
+
+    found: list[tuple[str, str]] = []
+    scanned = 0
+    for root, dirs, files in os.walk(top, followlinks=False, onerror=unreadable):
+        scanned += len(dirs) + len(files)
+        if scanned > _LINK_SCAN_CAP:
+            raise _LinkScanError(f"more than {_LINK_SCAN_CAP} entries under {top}")
+        if skill_tree:
+            has_skill_md = "SKILL.md" in files
+            dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS
+                       and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        parts = len(Path(root).relative_to(top).parts) + 1
+        if max_parts is None or parts <= max_parts:
+            for name in (*dirs, *files):
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    found.append((name, os.path.realpath(path)))
+        if max_parts is not None and parts >= max_parts:
+            dirs[:] = []
+    return found
+
+
+def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
+    """Gate a write that lands on a symlink target the project loaders follow.
+
+    Covered: protected spellings in the task's project anchors (cwd and its ancestors up to the
+    git root) that are or sit under a symlink, and every symlink inside a loader-read tree
+    (skills, plugins, top-level ``.cursor/rules/*.mdc``). Fails closed with a reason when the
+    anchors or a tree cannot be resolved or scanned.
+    """
+    try:
+        return _loader_symlink_match(resolved, task_id)
+    except (OSError, ValueError, RuntimeError, _LinkScanError):
+        return _UNVERIFIED_PROJECT_LINKS
+
+
+def _loader_symlink_match(resolved: str, task_id: str) -> str | None:
     from agent.prompt_builder import (
         AGENTS_MD_NAMES,
         CLAUDE_MD_NAMES,
@@ -317,17 +367,14 @@ def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
         _find_git_root,
     )
     from agent.skill_utils import PROJECT_SKILLS_SUBDIRS
-    try:
-        cwd = Path(os.path.realpath(str(_resolve_path_for_task(".", task_id))))
-        chain = [cwd, *cwd.parents]
-        root = _find_git_root(cwd)
-    except (OSError, ValueError, RuntimeError):
-        return None
+    cwd = Path(os.path.realpath(str(_resolve_path_for_task(".", task_id))))
+    chain = [cwd, *cwd.parents]
+    root = _find_git_root(cwd)
     anchors = chain[:chain.index(root) + 1] if root in chain else [cwd]
     names = (*HERMES_MD_NAMES, *AGENTS_MD_NAMES, *CLAUDE_MD_NAMES, CURSORRULES_NAME)
-    subs = (*PROJECT_SKILLS_SUBDIRS, os.path.join(".hermes", "plugins"))
+    plugins_sub = os.path.join(".hermes", "plugins")
     files = [Path(a, n) for a in anchors for n in names]
-    trees = [Path(a, sub) for a in anchors for sub in subs]
+    trees = [Path(a, sub) for a in anchors for sub in (*PROJECT_SKILLS_SUBDIRS, plugins_sub)]
     cursor_rules = [Path(a, *CURSOR_RULES_DIR) for a in anchors]
     base = os.path.basename(resolved)
     for spelling in files:
@@ -335,7 +382,7 @@ def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
             return base
     for spelling in trees:
         target = _symlink_target(spelling)
-        if target and (resolved == target or resolved.startswith(target + os.sep)):
+        if target and Path(resolved).is_relative_to(target):
             return base
     for anchor in anchors:
         target = _symlink_target(Path(anchor, ".hermes"))
@@ -346,7 +393,25 @@ def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
         if (target and os.path.dirname(resolved) == target
                 and base.lower().endswith(".mdc")):
             return base
-    return None
+    return base if _loader_child_link_hit(resolved, trees, cursor_rules) else None
+
+
+def _loader_child_link_hit(resolved: str, trees: list[Path], cursor_rules: list[Path]) -> bool:
+    """True when *resolved* is, or sits under, a symlink inside a loader-read tree or ``.cursor/rules``."""
+    # ponytail: the trees are walked on every write; _LINK_SCAN_CAP bounds the cost.
+    for tree in trees:
+        if os.path.isdir(tree):
+            skill_tree = tree.name != "plugins"
+            max_parts = None if skill_tree else 3
+            if any(Path(resolved).is_relative_to(target)
+                   for _name, target in _loader_linked_targets(os.path.realpath(tree), max_parts, skill_tree)):
+                return True
+    for cursor_dir in cursor_rules:
+        if os.path.isdir(cursor_dir) and any(
+                name.endswith(".mdc") and resolved == target
+                for name, target in _loader_linked_targets(os.path.realpath(cursor_dir), 1, False)):
+            return True
+    return False
 
 
 _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavailable."

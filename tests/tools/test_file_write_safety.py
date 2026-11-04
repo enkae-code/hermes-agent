@@ -901,6 +901,117 @@ class TestProtectedInstructionFiles:
         res = self._write(repo / "docs" / "instructions.txt", "injected")
         assert res.get("error") and "BLOCKED" in res["error"], res
 
+    @pytest.mark.require_symlinks
+    def test_new_skill_file_under_symlinked_hermes_dir_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """.hermes -> shared with no skills tree yet: a NEW SKILL.md lands in the loader's tree."""
+        repo = tmp_path / "repo"
+        (repo / "shared").mkdir(parents=True)
+        (repo / ".hermes").symlink_to(repo / "shared")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "shared" / "skills" / "x" / "SKILL.md", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert not (repo / "shared" / "skills").exists()
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
+    def test_unresolvable_cwd_fails_closed_for_linked_target(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools_write_guards as ft
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "docs" / "context.txt").write_text("original", encoding="utf-8")
+        (repo / "AGENTS.md").symlink_to(repo / "docs" / "context.txt")
+        monkeypatch.chdir(repo)
+        real_resolve = ft._resolve_path_for_task
+
+        def fail_cwd(path, task_id="default"):
+            if path == ".":
+                raise OSError("injected cwd resolution failure")
+            return real_resolve(path, task_id)
+
+        monkeypatch.setattr(ft, "_resolve_path_for_task", fail_cwd)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "docs" / "context.txt", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert (repo / "docs" / "context.txt").read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 1
+
+    def test_tree_linked_to_filesystem_root_gates_descendants(self, tmp_path, monkeypatch):
+        """Root-safe containment, classifier level: the link is modeled, so nothing under / is read."""
+        import tools.file_tools_write_guards as ft
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        monkeypatch.chdir(repo)
+        skills = os.path.join(os.path.realpath(repo), ".hermes", "skills")
+        real_symlink_target = ft._symlink_target
+        monkeypatch.setattr(
+            ft, "_symlink_target",
+            lambda spelling: "/" if str(spelling) == skills else real_symlink_target(spelling))
+        assert ft._loader_symlink_reason(str(tmp_path / "docs" / "context.txt"), "default") is not None
+
+    @pytest.mark.require_symlinks
+    def test_target_of_symlinked_child_skill_dir_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """.hermes/skills/x -> elsewhere: the skills walk follows the child link into elsewhere/."""
+        repo = tmp_path / "repo"
+        (repo / ".hermes" / "skills").mkdir(parents=True)
+        (repo / "elsewhere").mkdir()
+        (repo / ".hermes" / "skills" / "x").symlink_to(repo / "elsewhere")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "elsewhere" / "SKILL.md", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert not (repo / "elsewhere" / "SKILL.md").exists()
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
+    def test_target_of_symlinked_cursor_rule_is_gated(self, tmp_path, approvals, monkeypatch):
+        """.cursor/rules/a.mdc -> docs/context.txt: the cursor loader reads the target by its link name."""
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "docs" / "context.txt").write_text("original", encoding="utf-8")
+        (repo / ".cursor" / "rules").mkdir(parents=True)
+        (repo / ".cursor" / "rules" / "a.mdc").symlink_to(repo / "docs" / "context.txt")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "docs" / "context.txt", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert (repo / "docs" / "context.txt").read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
+    def test_unrelated_file_beside_symlinked_cursor_rule_stays_writable(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "docs" / "context.txt").write_text("original", encoding="utf-8")
+        (repo / ".cursor" / "rules").mkdir(parents=True)
+        (repo / ".cursor" / "rules" / "a.mdc").symlink_to(repo / "docs" / "context.txt")
+        monkeypatch.chdir(repo)
+        res = self._write(repo / "docs" / "other.md", "# other\n")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
+    @pytest.mark.require_symlinks
+    def test_link_scan_over_cap_fails_closed(self, tmp_path, approvals, monkeypatch):
+        import tools.file_tools_write_guards as ft
+        repo = tmp_path / "repo"
+        (repo / ".hermes" / "skills").mkdir(parents=True)
+        for i in range(3):
+            (repo / ".hermes" / "skills" / f"f{i}.txt").write_text("x", encoding="utf-8")
+        monkeypatch.setattr(ft, "_LINK_SCAN_CAP", 2)
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "ordinary.md", "x")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert not (repo / "ordinary.md").exists()
+
     def test_real_hermes_home_not_gated_by_this_check(
         self, tmp_path, approvals, monkeypatch
     ):
