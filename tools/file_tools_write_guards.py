@@ -186,12 +186,37 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # run from is a live target. Basenames match case-insensitively so case-variant spellings on
 # case-insensitive filesystems (macOS/Windows) cannot slip past; on case-sensitive filesystems most loaders
 # probe common case variants too, so the stricter behavior is kept uniform.
-_PROTECTED_INSTRUCTION_BASENAMES = frozenset({
-    "agents.md", "claude.md", "soul.md", ".cursorrules"})
+# SOUL.md is loaded by load_soul_md, not by the loader name tuples below. The other context names come
+# from agent.prompt_builder, the same tuples the loaders read (imported lazily: that module is heavy).
+_PROTECTED_INSTRUCTION_BASENAMES = frozenset({"soul.md"})
 # Files directly inside a project's ``.hermes`` dir that steer behavior (environment.json holds
 # shell commands `hermes verify` runs); work orders and proof
 # files beside them stay writable.
 _PROJECT_HERMES_CONFIG_BASENAMES = frozenset({"config.yaml", ".env", "environment.json"})
+
+
+def _prompt_loaded_names() -> tuple[frozenset[str], tuple[str, ...]]:
+    """Lowercased basenames the prompt loaders read, and the ``.cursor/rules`` dir parts."""
+    from agent.prompt_builder import (
+        AGENTS_MD_NAMES, CLAUDE_MD_NAMES, CURSOR_RULES_DIR, CURSORRULES_NAME, HERMES_MD_NAMES,
+    )
+    names = frozenset(n.lower() for n in (*HERMES_MD_NAMES, *AGENTS_MD_NAMES, *CLAUDE_MD_NAMES, CURSORRULES_NAME))
+    return names, tuple(CURSOR_RULES_DIR)
+
+
+def _in_project_code_tree(candidate: str) -> bool:
+    """True when *candidate* is a file below a project skills dir (``PROJECT_SKILLS_SUBDIRS``) or a
+    ``.hermes/plugins`` dir, anywhere in the path. Gated as whole trees: skills become prompt-visible
+    instructions and plugins execute code. The loaders decide whether to read them (trust list,
+    HERMES_ENABLE_PROJECT_PLUGINS); this gate does not, so the write is gated either way."""
+    from agent.skill_utils import PROJECT_SKILLS_SUBDIRS
+    parts = candidate.replace("\\", "/").split("/")
+    for sub in (*PROJECT_SKILLS_SUBDIRS, ".hermes/plugins"):
+        sub_parts = sub.replace(os.sep, "/").split("/")
+        n = len(sub_parts)
+        if any(parts[i:i + n] == sub_parts for i in range(len(parts) - n)):
+            return True
+    return False
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
@@ -242,11 +267,12 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
+    loaded_names, cursor_rules_dir = _prompt_loaded_names()
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
-        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
-                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
+        if (base_lower in _PROTECTED_INSTRUCTION_BASENAMES or base_lower in loaded_names
+                or any(fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns)):
             return base
         # Project-local .hermes config (<repo>/.hermes/config.yaml, .env) steers behavior too.
         # Only the IMMEDIATE parent counts — matching any ancestor would gate every write
@@ -254,6 +280,11 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         parts = candidate.replace("\\", "/").rstrip("/").split("/")
         if (len(parts) >= 2 and parts[-2] == ".hermes"
                 and base_lower in _PROJECT_HERMES_CONFIG_BASENAMES):
+            return candidate
+        # Top-level *.mdc under .cursor/rules is what the cursorrules loader globs; nothing deeper is read.
+        if base_lower.endswith(".mdc") and tuple(parts[-3:-1]) == cursor_rules_dir:
+            return candidate
+        if _in_project_code_tree(candidate):
             return candidate
     return None
 

@@ -654,7 +654,7 @@ class TestProtectedInstructionFiles:
     # ---- core behavior -------------------------------------------------
 
     @pytest.mark.parametrize(
-        "name", ["AGENTS.md", "CLAUDE.md", "SOUL.md", ".cursorrules"]
+        "name", ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "SOUL.md", ".cursorrules", ".hermes.md", "HERMES.md"]
     )
     def test_deny_blocks_write(self, tmp_path, approvals, name):
         target = tmp_path / name
@@ -802,6 +802,27 @@ class TestProtectedInstructionFiles:
         target = tmp_path / "repo" / ".hermes" / name
         assert ft._protected_instruction_reason(
             str(target), enabled=True, extra_patterns=[]) is not None
+
+    @pytest.mark.parametrize(
+        "rel",
+        [".hermes/skills/x/SKILL.md", ".agents/skills/x/SKILL.md", ".hermes/plugins/p/plugin.py",
+         ".cursor/rules/style.mdc"],
+    )
+    def test_prompt_loaded_project_tree_is_gated(self, tmp_path, approvals, rel):
+        approvals["answer"] = "deny"
+        res = self._write(tmp_path / "repo" / rel, "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert not (tmp_path / "repo" / rel).exists()
+        assert len(approvals["calls"]) == 1
+
+    def test_ordinary_docs_file_stays_writable(self, tmp_path, approvals):
+        """Only prompt-loaded names and project code trees are gated; repo docs are not."""
+        repo = tmp_path / "repo"
+        (repo / ".hermes").mkdir(parents=True)
+        (repo / "docs").mkdir()
+        res = self._write(repo / "docs" / "README.md", "# docs\n")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
 
     def test_real_hermes_home_not_gated_by_this_check(
         self, tmp_path, approvals, monkeypatch
