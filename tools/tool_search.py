@@ -306,7 +306,8 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
         _bridge_schema(
             TOOL_CALL_NAME,
             "Invoke deferred tools: `calls` is an array of {name, arguments}, one entry per "
-            "invocation (batch independent calls; results come back in order). Arguments match "
+            "invocation. Only connector (`connectors__`) calls batch; a local deferred tool takes "
+            "exactly one entry per tool_call. Arguments match "
             f"the schema from `{TOOL_DESCRIBE_NAME}`; approvals and hooks apply as usual.",
             {
                 "calls": {
