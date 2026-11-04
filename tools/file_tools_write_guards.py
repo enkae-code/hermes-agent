@@ -210,9 +210,10 @@ def _in_project_code_tree(candidate: str) -> bool:
     instructions and plugins execute code. The loaders decide whether to read them (trust list,
     HERMES_ENABLE_PROJECT_PLUGINS); this gate does not, so the write is gated either way."""
     from agent.skill_utils import PROJECT_SKILLS_SUBDIRS
-    parts = candidate.replace("\\", "/").split("/")
+    # Case-folded: on case-insensitive filesystems ``.Hermes/Skills`` is the same tree the loader reads.
+    parts = candidate.replace("\\", "/").lower().split("/")
     for sub in (*PROJECT_SKILLS_SUBDIRS, ".hermes/plugins"):
-        sub_parts = sub.replace(os.sep, "/").split("/")
+        sub_parts = sub.replace(os.sep, "/").lower().split("/")
         n = len(sub_parts)
         if any(parts[i:i + n] == sub_parts for i in range(len(parts) - n)):
             return True
@@ -267,7 +268,11 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
+    # ponytail: matches the write path and its realpath only. A write to the ordinary TARGET of a
+    # loader-visible symlink (``.hermes/skills -> skill-source``) is not gated; closing that means
+    # resolving every protected loader path per write. Same ceiling as the AGENTS.md/SOUL.md gate.
     loaded_names, cursor_rules_dir = _prompt_loaded_names()
+    cursor_rules_dir = tuple(p.lower() for p in cursor_rules_dir)
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
@@ -277,7 +282,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         # Project-local .hermes config (<repo>/.hermes/config.yaml, .env) steers behavior too.
         # Only the IMMEDIATE parent counts — matching any ancestor would gate every write
         # inside a checkout living under ~/.hermes.
-        parts = candidate.replace("\\", "/").rstrip("/").split("/")
+        parts = candidate.replace("\\", "/").rstrip("/").lower().split("/")
         if (len(parts) >= 2 and parts[-2] == ".hermes"
                 and base_lower in _PROJECT_HERMES_CONFIG_BASENAMES):
             return candidate

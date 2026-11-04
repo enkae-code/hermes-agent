@@ -806,7 +806,8 @@ class TestProtectedInstructionFiles:
     @pytest.mark.parametrize(
         "rel",
         [".hermes/skills/x/SKILL.md", ".agents/skills/x/SKILL.md", ".hermes/plugins/p/plugin.py",
-         ".cursor/rules/style.mdc"],
+         ".cursor/rules/style.mdc", ".Hermes/Skills/x/SKILL.md", ".HERMES/Plugins/p/plugin.py",
+         ".Cursor/Rules/style.mdc"],
     )
     def test_prompt_loaded_project_tree_is_gated(self, tmp_path, approvals, rel):
         approvals["answer"] = "deny"
