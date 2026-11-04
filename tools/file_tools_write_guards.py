@@ -268,9 +268,6 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
-    # ponytail: matches the write path and its realpath only. A write to the ordinary TARGET of a
-    # loader-visible symlink (``.hermes/skills -> skill-source``) is not gated; closing that means
-    # resolving every protected loader path per write. Same ceiling as the AGENTS.md/SOUL.md gate.
     loaded_names, cursor_rules_dir = _prompt_loaded_names()
     cursor_rules_dir = tuple(p.lower() for p in cursor_rules_dir)
     for candidate in (normalized, resolved):
@@ -291,6 +288,60 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
             return candidate
         if _in_project_code_tree(candidate):
             return candidate
+    return _loader_symlink_reason(resolved, task_id)
+
+
+def _symlink_target(spelling: Path) -> str | None:
+    """Realpath of a protected spelling that is a symlink, or sits under one; ``None`` for plain paths
+    and for names that do not exist (a dangling link still counts: its target can be created)."""
+    if not os.path.lexists(spelling):
+        return None
+    real = os.path.realpath(spelling)
+    return real if real != str(spelling) else None
+
+
+def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
+    """Gate a write that lands on the ordinary target of a loader-visible symlink.
+
+    The loaders read the protected spellings in the task's project anchors (cwd and its
+    ancestors up to the git root) through symlinks, so writing the link's target changes
+    the file the loader reads. Only spellings that are or sit under a symlink are checked;
+    a plain spelling is already covered by the name and tree rules above.
+    """
+    from agent.prompt_builder import (
+        AGENTS_MD_NAMES,
+        CLAUDE_MD_NAMES,
+        CURSOR_RULES_DIR,
+        CURSORRULES_NAME,
+        HERMES_MD_NAMES,
+        _find_git_root,
+    )
+    from agent.skill_utils import PROJECT_SKILLS_SUBDIRS
+    try:
+        cwd = Path(os.path.realpath(str(_resolve_path_for_task(".", task_id))))
+        chain = [cwd, *cwd.parents]
+        root = _find_git_root(cwd)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    anchors = chain[:chain.index(root) + 1] if root in chain else [cwd]
+    names = (*HERMES_MD_NAMES, *AGENTS_MD_NAMES, *CLAUDE_MD_NAMES, CURSORRULES_NAME)
+    subs = (*PROJECT_SKILLS_SUBDIRS, os.path.join(".hermes", "plugins"))
+    files = [Path(a, n) for a in anchors for n in names]
+    trees = [Path(a, sub) for a in anchors for sub in subs]
+    cursor_rules = [Path(a, *CURSOR_RULES_DIR) for a in anchors]
+    base = os.path.basename(resolved)
+    for spelling in files:
+        if _symlink_target(spelling) == resolved:
+            return base
+    for spelling in trees:
+        target = _symlink_target(spelling)
+        if target and (resolved == target or resolved.startswith(target + os.sep)):
+            return base
+    for spelling in cursor_rules:
+        target = _symlink_target(spelling)
+        if (target and os.path.dirname(resolved) == target
+                and base.lower().endswith(".mdc")):
+            return base
     return None
 
 

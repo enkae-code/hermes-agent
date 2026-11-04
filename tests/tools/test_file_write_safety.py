@@ -825,6 +825,67 @@ class TestProtectedInstructionFiles:
         assert not res.get("error"), res
         assert approvals["calls"] == []
 
+    @pytest.mark.require_symlinks
+    def test_target_of_symlinked_skills_dir_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """The loader reads .hermes/skills through the link, so the link's target is protected."""
+        repo = tmp_path / "repo"
+        (repo / ".hermes").mkdir(parents=True)
+        (repo / "skill-source" / "x").mkdir(parents=True)
+        (repo / ".hermes" / "skills").symlink_to(repo / "skill-source")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "skill-source" / "x" / "SKILL.md", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert not (repo / "skill-source" / "x" / "SKILL.md").exists()
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
+    def test_target_of_symlinked_agents_md_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """AGENTS.md -> docs/instructions.txt: the loader reads the target as project context."""
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "docs" / "instructions.txt").write_text("original", encoding="utf-8")
+        (repo / "AGENTS.md").symlink_to(repo / "docs" / "instructions.txt")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "docs" / "instructions.txt", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert (repo / "docs" / "instructions.txt").read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
+    def test_unrelated_file_beside_symlinked_agents_md_stays_writable(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        (repo / "docs" / "instructions.txt").write_text("original", encoding="utf-8")
+        (repo / "AGENTS.md").symlink_to(repo / "docs" / "instructions.txt")
+        monkeypatch.chdir(repo)
+        res = self._write(repo / "docs" / "other.md", "# other\n")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
+    @pytest.mark.require_symlinks
+    def test_symlink_anchor_is_checked_from_git_subdirectory(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """Anchors run from the cwd up to the git root, so a root-level link applies from a subdir."""
+        repo = tmp_path / "repo"
+        (repo / ".git").mkdir(parents=True)
+        (repo / "pkg").mkdir()
+        (repo / "docs").mkdir()
+        (repo / "docs" / "instructions.txt").write_text("original", encoding="utf-8")
+        (repo / "AGENTS.md").symlink_to(repo / "docs" / "instructions.txt")
+        monkeypatch.chdir(repo / "pkg")
+        approvals["answer"] = "deny"
+        res = self._write(repo / "docs" / "instructions.txt", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+
     def test_real_hermes_home_not_gated_by_this_check(
         self, tmp_path, approvals, monkeypatch
     ):
