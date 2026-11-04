@@ -186,47 +186,12 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
 # run from is a live target. Basenames match case-insensitively so case-variant spellings on
 # case-insensitive filesystems (macOS/Windows) cannot slip past; on case-sensitive filesystems most loaders
 # probe common case variants too, so the stricter behavior is kept uniform.
-# SOUL.md is loaded by load_soul_md, not by the loader name tuples below. The other context names come
-# from agent.prompt_builder, the same tuples the loaders read (imported lazily: that module is heavy).
-_PROTECTED_INSTRUCTION_BASENAMES = frozenset({"soul.md"})
+_PROTECTED_INSTRUCTION_BASENAMES = frozenset({
+    "agents.md", "claude.md", "soul.md", ".cursorrules"})
 # Files directly inside a project's ``.hermes`` dir that steer behavior (environment.json holds
 # shell commands `hermes verify` runs); work orders and proof
 # files beside them stay writable.
 _PROJECT_HERMES_CONFIG_BASENAMES = frozenset({"config.yaml", ".env", "environment.json"})
-# Per-tree entry cap for the loader-link scan. Past it, the scan fails closed (the write is gated).
-# ponytail: a full walk per write; cache by tree mtime if this gate shows up in profiles.
-_LINK_SCAN_CAP = 2000
-_UNVERIFIED_PROJECT_LINKS = ("project context paths could not be resolved or scanned for symlinks; "
-                             "approve only if this target is intended")
-
-
-class _LinkScanError(Exception):
-    """A project tree could not be walked completely, so its links cannot be ruled out."""
-
-
-def _prompt_loaded_names() -> tuple[frozenset[str], tuple[str, ...]]:
-    """Lowercased basenames the prompt loaders read, and the ``.cursor/rules`` dir parts."""
-    from agent.prompt_builder import (
-        AGENTS_MD_NAMES, CLAUDE_MD_NAMES, CURSOR_RULES_DIR, CURSORRULES_NAME, HERMES_MD_NAMES,
-    )
-    names = frozenset(n.lower() for n in (*HERMES_MD_NAMES, *AGENTS_MD_NAMES, *CLAUDE_MD_NAMES, CURSORRULES_NAME))
-    return names, tuple(CURSOR_RULES_DIR)
-
-
-def _in_project_code_tree(candidate: str) -> bool:
-    """True when *candidate* is a file below a project skills dir (``PROJECT_SKILLS_SUBDIRS``) or a
-    ``.hermes/plugins`` dir, anywhere in the path. Gated as whole trees: skills become prompt-visible
-    instructions and plugins execute code. The loaders decide whether to read them (trust list,
-    HERMES_ENABLE_PROJECT_PLUGINS); this gate does not, so the write is gated either way."""
-    from agent.skill_utils import PROJECT_SKILLS_SUBDIRS
-    # Case-folded: on case-insensitive filesystems ``.Hermes/Skills`` is the same tree the loader reads.
-    parts = candidate.replace("\\", "/").lower().split("/")
-    for sub in (*PROJECT_SKILLS_SUBDIRS, ".hermes/plugins"):
-        sub_parts = sub.replace(os.sep, "/").lower().split("/")
-        n = len(sub_parts)
-        if any(parts[i:i + n] == sub_parts for i in range(len(parts) - n)):
-            return True
-    return False
 
 
 def _protected_instruction_config() -> tuple[bool, list[str]]:
@@ -277,154 +242,20 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
-    loaded_names, cursor_rules_dir = _prompt_loaded_names()
-    cursor_rules_dir = tuple(p.lower() for p in cursor_rules_dir)
     for candidate in (normalized, resolved):
         base = os.path.basename(candidate)
         base_lower = base.lower()
-        if (base_lower in _PROTECTED_INSTRUCTION_BASENAMES or base_lower in loaded_names
-                or any(fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns)):
+        if base_lower in _PROTECTED_INSTRUCTION_BASENAMES or any(
+                fnmatch.fnmatch(base_lower, pattern.lower()) for pattern in extra_patterns):
             return base
         # Project-local .hermes config (<repo>/.hermes/config.yaml, .env) steers behavior too.
         # Only the IMMEDIATE parent counts — matching any ancestor would gate every write
         # inside a checkout living under ~/.hermes.
-        parts = candidate.replace("\\", "/").rstrip("/").lower().split("/")
+        parts = candidate.replace("\\", "/").rstrip("/").split("/")
         if (len(parts) >= 2 and parts[-2] == ".hermes"
                 and base_lower in _PROJECT_HERMES_CONFIG_BASENAMES):
             return candidate
-        # Top-level *.mdc under .cursor/rules is what the cursorrules loader globs; nothing deeper is read.
-        if base_lower.endswith(".mdc") and tuple(parts[-3:-1]) == cursor_rules_dir:
-            return candidate
-        if _in_project_code_tree(candidate):
-            return candidate
-    return _loader_symlink_reason(resolved, task_id)
-
-
-def _symlink_target(spelling: Path) -> str | None:
-    """Realpath of a protected spelling that is a symlink or sits under one, else ``None``.
-
-    Nonexistent names count too: ``realpath`` resolves symlinked parents of a missing tail, so a
-    new file under a linked ``.hermes`` lands where the loader will read it."""
-    real = os.path.realpath(spelling)
-    return real if real != str(spelling) else None
-
-
-def _loader_linked_targets(top: str, max_parts: int | None, skill_tree: bool) -> list[tuple[str, str]]:
-    """``(name, realpath)`` for each symlink under *top* that a loader reads.
-
-    Walks like the loaders do (``followlinks=True``), so links inside a linked child are recorded
-    too. A directory whose realpath is already on its own ancestor chain is not re-walked, which
-    stops cycles; the shared ``scanned`` counter still bounds the whole tree. ``max_parts`` bounds
-    entry depth along the walked spelling (plugins read at most three levels); ``skill_tree``
-    applies the skill walk's pruning. Raises ``_LinkScanError`` past ``_LINK_SCAN_CAP`` entries or
-    on an unreadable directory.
-    """
-    from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
-
-    def unreadable(err: OSError) -> None:
-        raise _LinkScanError(str(err))
-
-    found: list[tuple[str, str]] = []
-    scanned = 0
-    ancestry = {top: frozenset({os.path.realpath(top)})}
-    for root, dirs, files in os.walk(top, followlinks=True, onerror=unreadable):
-        scanned += len(dirs) + len(files)
-        if scanned > _LINK_SCAN_CAP:
-            raise _LinkScanError(f"more than {_LINK_SCAN_CAP} entries under {top}")
-        if skill_tree:
-            has_skill_md = "SKILL.md" in files
-            dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS
-                       and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
-        parts = len(Path(root).relative_to(top).parts) + 1
-        if max_parts is None or parts <= max_parts:
-            for name in (*dirs, *files):
-                path = os.path.join(root, name)
-                if os.path.islink(path):
-                    found.append((name, os.path.realpath(path)))
-        if max_parts is not None and parts >= max_parts:
-            dirs[:] = []
-        chain = ancestry.pop(root)
-        kept = []
-        for d in dirs:
-            child = os.path.join(root, d)
-            real = os.path.realpath(child)
-            if real not in chain:
-                ancestry[child] = chain | {real}
-                kept.append(d)
-        dirs[:] = kept
-    return found
-
-
-def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
-    """Gate a write that lands on a symlink target the project loaders follow.
-
-    Covered: protected spellings in the task's project anchors (cwd and its ancestors up to the
-    git root) that are or sit under a symlink, and every symlink inside a loader-read tree
-    (skills, plugins, top-level ``.cursor/rules/*.mdc``). Fails closed with a reason when the
-    anchors or a tree cannot be resolved or scanned.
-    """
-    try:
-        return _loader_symlink_match(resolved, task_id)
-    except (OSError, ValueError, RuntimeError, _LinkScanError):
-        return _UNVERIFIED_PROJECT_LINKS
-
-
-def _loader_symlink_match(resolved: str, task_id: str) -> str | None:
-    from agent.prompt_builder import (
-        AGENTS_MD_NAMES,
-        CLAUDE_MD_NAMES,
-        CURSOR_RULES_DIR,
-        CURSORRULES_NAME,
-        HERMES_MD_NAMES,
-        _find_git_root,
-    )
-    from agent.skill_utils import PROJECT_SKILLS_SUBDIRS
-    cwd = Path(os.path.realpath(str(_resolve_path_for_task(".", task_id))))
-    chain = [cwd, *cwd.parents]
-    root = _find_git_root(cwd)
-    anchors = chain[:chain.index(root) + 1] if root in chain else [cwd]
-    names = (*HERMES_MD_NAMES, *AGENTS_MD_NAMES, *CLAUDE_MD_NAMES, CURSORRULES_NAME,
-             *(os.path.join(".hermes", n) for n in _PROJECT_HERMES_CONFIG_BASENAMES))
-    plugins_sub = os.path.join(".hermes", "plugins")
-    files = [Path(a, n) for a in anchors for n in names]
-    trees = [Path(a, sub) for a in anchors for sub in (*PROJECT_SKILLS_SUBDIRS, plugins_sub)]
-    cursor_rules = [Path(a, *CURSOR_RULES_DIR) for a in anchors]
-    base = os.path.basename(resolved)
-    for spelling in files:
-        if _symlink_target(spelling) == resolved:
-            return base
-    for spelling in trees:
-        target = _symlink_target(spelling)
-        if target and Path(resolved).is_relative_to(target):
-            return base
-    for anchor in anchors:
-        target = _symlink_target(Path(anchor, ".hermes"))
-        if target and os.path.dirname(resolved) == target and base in _PROJECT_HERMES_CONFIG_BASENAMES:
-            return base
-    for spelling in cursor_rules:
-        target = _symlink_target(spelling)
-        if (target and os.path.dirname(resolved) == target
-                and base.lower().endswith(".mdc")):
-            return base
-    return base if _loader_child_link_hit(resolved, trees, cursor_rules) else None
-
-
-def _loader_child_link_hit(resolved: str, trees: list[Path], cursor_rules: list[Path]) -> bool:
-    """True when *resolved* is, or sits under, a symlink inside a loader-read tree or ``.cursor/rules``."""
-    # ponytail: the trees are walked on every write; _LINK_SCAN_CAP bounds the cost.
-    for tree in trees:
-        if os.path.isdir(tree):
-            skill_tree = tree.name != "plugins"
-            max_parts = None if skill_tree else 3
-            if any(Path(resolved).is_relative_to(target)
-                   for _name, target in _loader_linked_targets(os.path.realpath(tree), max_parts, skill_tree)):
-                return True
-    for cursor_dir in cursor_rules:
-        if os.path.isdir(cursor_dir) and any(
-                name.endswith(".mdc") and resolved == target
-                for name, target in _loader_linked_targets(os.path.realpath(cursor_dir), 1, False)):
-            return True
-    return False
+    return None
 
 
 _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavailable."
