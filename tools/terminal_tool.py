@@ -1008,6 +1008,12 @@ def _resolve_command_cwd(
     if workdir:
         return coerce_ssh_remote_cwd(_container_visible_cwd(workdir, env_type, env), env_type)
     recorded = get_session_cwd(session_key)
+    if recorded and env_type == "local" and not os.path.isdir(recorded):
+        logger.info(
+            "Ignoring recorded session cwd %r: directory no longer exists. Using %r instead.",
+            recorded, default_cwd,
+        )
+        recorded = None
     if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(
         recorded, mounted_host=mounted_host
     ) and not _in_sandbox_home(recorded, env):

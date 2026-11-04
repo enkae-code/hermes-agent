@@ -74,7 +74,7 @@ _OUTPUT_HINTS: list[Callable[[str, str], Optional[str]]] = [
 # Exit-code-only hints for codes the terminal_tool semantics table does not
 # cover per-command. Checked after output patterns.
 _EXIT_CODE_HINTS: dict[int, str] = {
-    126: "Exit 126: the file was found but is not executable — `chmod +x` it or invoke it via its interpreter (e.g. `bash script.sh`).",
+    126: "Exit 126: the file was found but is not executable — `chmod +x` it or invoke it via its interpreter (e.g. `bash script.sh`). A `cd:` failure or a missing working directory also gives 126; pass an explicit `workdir` that exists.",
     137: "Exit 137: the process was SIGKILLed — usually out-of-memory or an external kill. Reduce memory use or check `dmesg | tail` before retrying.",
     124: "Exit 124: the command hit its timeout. Raise timeout= (foreground max 600s) or run it with background=true and notify_on_complete=true.",
 }

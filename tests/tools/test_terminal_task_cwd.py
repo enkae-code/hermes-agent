@@ -118,12 +118,14 @@ def test_explicit_workdir_does_not_persist_into_session_cwd(monkeypatch):
     assert all(cwd != "/one/off/dir" for _, cwd in recorded), recorded
 
 
-def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
+def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(tmp_path, monkeypatch):
     """Background process launches must also use the recorded session cwd."""
+
+    live = str(tmp_path)
 
     class FakeEnv:
         env = {}
-        cwd = "/workspace/live"
+        cwd = live
 
     class FakeRegistry:
         def __init__(self):
@@ -151,7 +153,7 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
         lambda command, env_type, **kwargs: {"approved": True},
     )
     monkeypatch.setattr(process_registry_mod, "process_registry", registry)
-    terminal_tool.record_session_cwd(task_id, "/workspace/live")
+    terminal_tool.record_session_cwd(task_id, live)
 
     result = json.loads(
         terminal_tool.terminal_tool(
@@ -166,7 +168,7 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
     # (it doesn't propagate to tool-worker threads), so process.kill / stop can
     # still find and terminate this background process.
     assert len(registry.calls) == 1
-    assert registry.calls[0]["cwd"] == "/workspace/live"
+    assert registry.calls[0]["cwd"] == live
     assert registry.calls[0]["session_key"] == task_id
 
 
