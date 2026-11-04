@@ -1015,6 +1015,7 @@ def _resume_eager(ctx: _Resume) -> dict:
         if live is not None:
             with contextlib.suppress(Exception):
                 agent.close()
+            refusal = _resume_attach_live_locked(ctx, *live)
         else:
             try:
                 with _profile_build_scope(ctx.profile_home):
@@ -1049,7 +1050,7 @@ def _resume_eager(ctx: _Resume) -> dict:
                 return _err(ctx.rid, 5000, resume_failed_message(e))
             session = _sessions.get(sid) or {}
     if live is not None:
-        return _resume_reuse_live(ctx, *live)
+        return refusal or _resume_reuse_payload(ctx, *live)
     return _resume_response(
         ctx, sid, session, info=_session_info(agent, session), display=display_history, count_source=raw_history,
         started_at=float(session.get("created_at") or time.time()),
