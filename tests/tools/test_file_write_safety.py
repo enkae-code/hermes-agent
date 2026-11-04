@@ -842,6 +842,21 @@ class TestProtectedInstructionFiles:
         assert len(approvals["calls"]) == 1
 
     @pytest.mark.require_symlinks
+    def test_target_of_symlinked_project_hermes_config_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """.hermes -> shared-hermes: the project config Hermes reads lives at the link's target."""
+        repo = tmp_path / "repo"
+        (repo / "shared-hermes").mkdir(parents=True)
+        (repo / ".hermes").symlink_to(repo / "shared-hermes")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "shared-hermes" / "config.yaml", "approvals: {mode: off}")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert not (repo / "shared-hermes" / "config.yaml").exists()
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
     def test_target_of_symlinked_agents_md_is_gated(
         self, tmp_path, approvals, monkeypatch
     ):

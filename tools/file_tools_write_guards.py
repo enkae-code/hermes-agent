@@ -337,6 +337,10 @@ def _loader_symlink_reason(resolved: str, task_id: str) -> str | None:
         target = _symlink_target(spelling)
         if target and (resolved == target or resolved.startswith(target + os.sep)):
             return base
+    for anchor in anchors:
+        target = _symlink_target(Path(anchor, ".hermes"))
+        if target and os.path.dirname(resolved) == target and base in _PROJECT_HERMES_CONFIG_BASENAMES:
+            return base
     for spelling in cursor_rules:
         target = _symlink_target(spelling)
         if (target and os.path.dirname(resolved) == target
