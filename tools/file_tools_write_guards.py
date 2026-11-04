@@ -312,10 +312,12 @@ def _symlink_target(spelling: Path) -> str | None:
 def _loader_linked_targets(top: str, max_parts: int | None, skill_tree: bool) -> list[tuple[str, str]]:
     """``(name, realpath)`` for each symlink under *top* that a loader reads.
 
-    Links are recorded, never followed: a linked dir's contents are caught by the realpath
-    containment check in the caller. ``max_parts`` bounds entry depth (plugins read at most three
-    levels); ``skill_tree`` applies the skill walk's pruning. Raises ``_LinkScanError`` past
-    ``_LINK_SCAN_CAP`` entries or on an unreadable directory.
+    Walks like the loaders do (``followlinks=True``), so links inside a linked child are recorded
+    too. A directory whose realpath is already on its own ancestor chain is not re-walked, which
+    stops cycles; the shared ``scanned`` counter still bounds the whole tree. ``max_parts`` bounds
+    entry depth along the walked spelling (plugins read at most three levels); ``skill_tree``
+    applies the skill walk's pruning. Raises ``_LinkScanError`` past ``_LINK_SCAN_CAP`` entries or
+    on an unreadable directory.
     """
     from agent.skill_utils import EXCLUDED_SKILL_DIRS, SKILL_SUPPORT_DIRS
 
@@ -324,7 +326,8 @@ def _loader_linked_targets(top: str, max_parts: int | None, skill_tree: bool) ->
 
     found: list[tuple[str, str]] = []
     scanned = 0
-    for root, dirs, files in os.walk(top, followlinks=False, onerror=unreadable):
+    ancestry = {top: frozenset({os.path.realpath(top)})}
+    for root, dirs, files in os.walk(top, followlinks=True, onerror=unreadable):
         scanned += len(dirs) + len(files)
         if scanned > _LINK_SCAN_CAP:
             raise _LinkScanError(f"more than {_LINK_SCAN_CAP} entries under {top}")
@@ -340,6 +343,15 @@ def _loader_linked_targets(top: str, max_parts: int | None, skill_tree: bool) ->
                     found.append((name, os.path.realpath(path)))
         if max_parts is not None and parts >= max_parts:
             dirs[:] = []
+        chain = ancestry.pop(root)
+        kept = []
+        for d in dirs:
+            child = os.path.join(root, d)
+            real = os.path.realpath(child)
+            if real not in chain:
+                ancestry[child] = chain | {real}
+                kept.append(d)
+        dirs[:] = kept
     return found
 
 
@@ -371,7 +383,8 @@ def _loader_symlink_match(resolved: str, task_id: str) -> str | None:
     chain = [cwd, *cwd.parents]
     root = _find_git_root(cwd)
     anchors = chain[:chain.index(root) + 1] if root in chain else [cwd]
-    names = (*HERMES_MD_NAMES, *AGENTS_MD_NAMES, *CLAUDE_MD_NAMES, CURSORRULES_NAME)
+    names = (*HERMES_MD_NAMES, *AGENTS_MD_NAMES, *CLAUDE_MD_NAMES, CURSORRULES_NAME,
+             *(os.path.join(".hermes", n) for n in _PROJECT_HERMES_CONFIG_BASENAMES))
     plugins_sub = os.path.join(".hermes", "plugins")
     files = [Path(a, n) for a in anchors for n in names]
     trees = [Path(a, sub) for a in anchors for sub in (*PROJECT_SKILLS_SUBDIRS, plugins_sub)]

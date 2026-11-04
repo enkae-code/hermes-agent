@@ -1012,6 +1012,72 @@ class TestProtectedInstructionFiles:
         assert res.get("error") and "BLOCKED" in res["error"], res
         assert not (repo / "ordinary.md").exists()
 
+    @pytest.mark.require_symlinks
+    def test_target_of_link_inside_linked_skill_is_gated(self, tmp_path, approvals, monkeypatch):
+        """skills/x -> A and A/SKILL.md -> docs/s.txt: the skill loader reads docs/s.txt via the inner link."""
+        repo = tmp_path / "repo"
+        (repo / ".hermes" / "skills").mkdir(parents=True)
+        (repo / "A").mkdir()
+        (repo / "docs").mkdir()
+        (repo / "docs" / "s.txt").write_text("original", encoding="utf-8")
+        (repo / ".hermes" / "skills" / "x").symlink_to(repo / "A")
+        (repo / "A" / "SKILL.md").symlink_to(repo / "docs" / "s.txt")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "docs" / "s.txt", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert (repo / "docs" / "s.txt").read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
+    def test_target_of_link_inside_linked_plugin_is_gated(self, tmp_path, approvals, monkeypatch):
+        """plugins/x -> P and P/__init__.py -> docs/code.txt: the plugin loader imports the inner link."""
+        repo = tmp_path / "repo"
+        (repo / ".hermes" / "plugins").mkdir(parents=True)
+        (repo / "P").mkdir()
+        (repo / "docs").mkdir()
+        (repo / "docs" / "code.txt").write_text("original", encoding="utf-8")
+        (repo / ".hermes" / "plugins" / "x").symlink_to(repo / "P")
+        (repo / "P" / "__init__.py").symlink_to(repo / "docs" / "code.txt")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "docs" / "code.txt", "injected")
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert (repo / "docs" / "code.txt").read_text(encoding="utf-8") == "original"
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.require_symlinks
+    def test_directory_link_cycle_under_skills_terminates(self, tmp_path, approvals, monkeypatch):
+        """a/b -> ../b and b/a -> ../a: the walk stops at the cycle and ordinary files stay writable."""
+        repo = tmp_path / "repo"
+        (repo / ".hermes" / "skills").mkdir(parents=True)
+        (repo / ".hermes" / "skills" / "a").mkdir()
+        (repo / ".hermes" / "skills" / "b").mkdir()
+        (repo / ".hermes" / "skills" / "a" / "b").symlink_to(repo / ".hermes" / "skills" / "b")
+        (repo / ".hermes" / "skills" / "b" / "a").symlink_to(repo / ".hermes" / "skills" / "a")
+        (repo / "docs").mkdir()
+        monkeypatch.chdir(repo)
+        res = self._write(repo / "docs" / "other.md", "# other\n")
+        assert not res.get("error"), res
+        assert approvals["calls"] == []
+
+    @pytest.mark.require_symlinks
+    def test_outgoing_link_from_project_environment_json_is_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """.hermes/environment.json -> docs/env.json: `hermes verify` reads the commands through the link."""
+        repo = tmp_path / "repo"
+        (repo / ".hermes").mkdir(parents=True)
+        (repo / "docs").mkdir()
+        (repo / "docs" / "env.json").write_text("{}", encoding="utf-8")
+        (repo / ".hermes" / "environment.json").symlink_to(repo / "docs" / "env.json")
+        monkeypatch.chdir(repo)
+        approvals["answer"] = "deny"
+        res = self._write(repo / "docs" / "env.json", '{"commands": []}')
+        assert res.get("error") and "BLOCKED" in res["error"], res
+        assert (repo / "docs" / "env.json").read_text(encoding="utf-8") == "{}"
+        assert len(approvals["calls"]) == 1
+
     def test_real_hermes_home_not_gated_by_this_check(
         self, tmp_path, approvals, monkeypatch
     ):
