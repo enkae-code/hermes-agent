@@ -346,6 +346,37 @@ async def test_accepted_watch_event_is_never_redelivered(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_watch_drains_inject_one_event_once(monkeypatch, tmp_path):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    injections = []
+
+    class _BlockingHandler(AdmittingHandler):
+        async def _execute_mock_call(self, event, *args, **kwargs):
+            injections.append(event)
+            if len(injections) == 1:
+                entered.set()
+                await release.wait()  # the first delivery stays in flight
+            return await super()._execute_mock_call(event, *args, **kwargs)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.adapters[Platform.TELEGRAM].handle_message = _BlockingHandler()
+    completion_queue = queue.Queue()
+    evt = {**_watch_event(), "event_id": "ev-concurrent"}
+    completion_queue.put(evt)
+
+    first = asyncio.create_task(runner._drain_watch_notifications(completion_queue))
+    await entered.wait()
+    completion_queue.put(dict(evt))  # a second copy of the same event drains while the first is in flight
+    await runner._drain_watch_notifications(completion_queue)
+    release.set()
+    await first
+
+    assert len(injections) == 1
+    assert completion_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_post_turn_watch_drain_all_injects_from_queued_event_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

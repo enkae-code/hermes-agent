@@ -726,31 +726,47 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 # instead of re-attempting admission every 2 s (#140899).
                 completion_queue.put(evt)
                 continue
-            # An accepted event re-entering the queue must not reach the agent again.
+            # An accepted event re-entering the queue must not reach the agent again. The claim is
+            # taken before delivery awaits so a concurrent drain holding a copy cannot inject it too.
             identity = self._completion_delivery_identity(evt)
-            if identity is not None and self._completion_identity_seen(identity):
+            if identity is not None and self._completion_identity_seen(
+                identity, claim=True
+            ):
                 continue
-            async with self._completion_event_scope(evt):
-                from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt):
-                    continue
-                if self._load_background_notifications_mode() == "off":
-                    continue
-                if evt.get("type") == "heartbeat":
-                    from gateway.session_automation import deliver_heartbeat
-                    delivered = await deliver_heartbeat(self, evt)
-                else:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
+            delivered = None
+            try:
+                async with self._completion_event_scope(evt):
+                    from tools.process_registry_notifications import (
+                        should_surface_notification,
+                    )
+
+                    if not should_surface_notification(evt):
                         continue
-                    try:
-                        delivered = await self._inject_watch_notification(synth_text, evt)
-                    except Exception:
-                        logger.exception("Watch notification injection error")
-                        delivered = False
-            if delivered is True and identity is not None:
-                with self._completion_delivery_lock:
-                    self._mark_completions_delivered_locked((identity,))
+                    if self._load_background_notifications_mode() == "off":
+                        continue
+                    if evt.get("type") == "heartbeat":
+                        from gateway.session_automation import deliver_heartbeat
+
+                        delivered = await deliver_heartbeat(self, evt)
+                    else:
+                        synth_text = _format_gateway_process_notification(evt)
+                        if not synth_text:
+                            continue
+                        try:
+                            delivered = await self._inject_watch_notification(
+                                synth_text, evt
+                            )
+                        except Exception:
+                            logger.exception("Watch notification injection error")
+                            delivered = False
+            finally:
+                if identity is not None:
+                    with self._completion_delivery_lock:
+                        if delivered is True:
+                            self._mark_completions_delivered_locked((identity,))
+                        else:
+                            # Release the claim so a refused event is retried on backoff.
+                            self._completion_deliveries_inflight.discard(identity)
             # The original event: a requeued tick folds again from what is still queued.
             if delivered is False:
                 self._requeue_refused_watch_event(completion_queue, evt)
