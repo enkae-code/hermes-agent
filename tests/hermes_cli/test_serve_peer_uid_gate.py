@@ -26,10 +26,10 @@ def _hex_addr(ip: str) -> str:
     return "".join(packed[i:i + 4][::-1].hex().upper() for i in range(0, 16, 4))
 
 
-def _row(local: tuple[str, int], remote: tuple[str, int], uid: int) -> str:
+def _row(local: tuple[str, int], remote: tuple[str, int], uid: int, inode: int = 12345) -> str:
     return (
         f"   0: {_hex_addr(local[0])}:{local[1]:04X} {_hex_addr(remote[0])}:{remote[1]:04X} "
-        f"01 00000000:00000000 00:00000000 00000000 {uid:5d}        0 12345 1 "
+        f"01 00000000:00000000 00:00000000 00000000 {uid:5d}        0 {inode} 1 "
         "0000000000000000 100 0 0 10 0"
     )
 
@@ -60,7 +60,7 @@ def test_parser_finds_owner_uid_in_tcp_and_tcp6():
     # ::1 client over tcp6.
     v6 = _table(_row(("::1", 40002), ("::1", 9119), 1004))
     assert proc_net_socket_uid(("::1", 40002), ("::1", 9119), [v6]) == 1004
-    # Client IP as a mapped string against a plain tcp6 row, and the reverse.
+    # Client IP as a mapped string against a plain tcp6 row (different addresses, same socket).
     assert proc_net_socket_uid(("::ffff:127.0.0.1", 40002), ("::1", 9119), [v6]) is None
 
 
@@ -72,6 +72,36 @@ def test_parser_fails_closed_without_a_matching_row():
     assert proc_net_socket_uid(("127.0.0.1", 40000), ("127.0.0.1", 9120), [table]) is None
     assert proc_net_socket_uid(("127.0.0.1", 40000), None, [table]) is None
     assert proc_net_socket_uid(("127.0.0.1", 40000), ("127.0.0.1", 9119), []) is None
+
+
+def test_time_wait_row_with_uid_zero_is_not_matched():
+    """inode 0 (TIME_WAIT, orphaned FIN_WAIT2) reports uid 0 whoever the peer is: never an owner."""
+    from hermes_cli.web_server_boundary import proc_net_socket_uid
+
+    client, server = ("127.0.0.1", 40000), ("127.0.0.1", 9119)
+    time_wait = _table(_row(client, server, 0, inode=0))
+    assert proc_net_socket_uid(client, server, [time_wait]) is None
+    # A live row after it still wins: the skip continues the scan rather than stopping it.
+    live = _table(_row(client, server, 0, inode=0), _row(client, server, 1002))
+    assert proc_net_socket_uid(client, server, [live]) == 1002
+
+
+def test_gate_reads_both_tables_because_the_client_family_is_not_visible(monkeypatch):
+    """Both tables, always: a dual-stack server sees an IPv4 client as ``::ffff:`` but the client's
+    socket is AF_INET, listed in tcp. Reading tcp6 alone refuses the owner's own client."""
+    import io
+
+    import hermes_cli.web_server_boundary as boundary
+
+    opened = []
+
+    def _fake_open(path, *_, **__):
+        opened.append(path)
+        return io.StringIO("")
+
+    monkeypatch.setattr(boundary, "open", _fake_open, raising=False)
+    assert boundary._proc_net_tables() == ["", ""]
+    assert opened == ["/proc/net/tcp", "/proc/net/tcp6"]
 
 
 def _uvicorn_server_scope(app):
@@ -175,8 +205,11 @@ def test_in_process_selftest_is_not_refused(serve_app, monkeypatch):
         raise AssertionError("/proc must not be read for an in-process request")
 
     monkeypatch.setattr(boundary, "_proc_net_tables", _boom)
+    monkeypatch.setattr(DASHBOARD_HEALTH, "selftest_http_status", None)
     asyncio.run(serve_app._dashboard_selftest_once())
-    # This sandbox has no session store, so the route answers 503; the gate's refusal would be 403.
+    # The self-test swallows exceptions: a gate that reads /proc records None, not a status. So
+    # require a real response status, and that it is not the gate's 403.
+    assert DASHBOARD_HEALTH.selftest_http_status is not None
     assert DASHBOARD_HEALTH.selftest_http_status != 403
 
 
@@ -196,7 +229,10 @@ def test_gated_mode_is_not_checked(serve_app, monkeypatch):
     import hermes_cli.web_server_boundary as boundary
     from fastapi.testclient import TestClient
 
-    _set_owner(monkeypatch, boundary, os.getuid() + 1)
+    def _boom():
+        raise AssertionError("/proc must not be read in gated mode")
+
+    monkeypatch.setattr(boundary, "_proc_net_tables", _boom)
     # setitem on the backing dict: setattr's undo would delattr a key State never had.
     monkeypatch.setitem(serve_app.app.state._state, "auth_required", True)
     client = TestClient(serve_app.app, client=("127.0.0.1", 40000), base_url="http://127.0.0.1:9119")

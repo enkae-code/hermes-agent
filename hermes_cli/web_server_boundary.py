@@ -7,6 +7,7 @@ DNS-rebinding Host check and gate decision. ``hermes_cli.web_server`` and
 ``hermes_cli.web_server_chat`` re-export these names, so ``web_server.<name>`` keeps working.
 """
 
+import asyncio
 import ipaddress
 import os
 import re
@@ -238,7 +239,8 @@ def proc_net_socket_uid(client, server, tables) -> Optional[int]:
     for table in tables:
         for line in table.splitlines()[1:]:
             fields = line.split()
-            if len(fields) < 8:
+            # inode 0: TIME_WAIT / orphaned sockets, whose uid column is 0 whatever the peer account.
+            if len(fields) < 10 or fields[9] == "0":
                 continue
             try:
                 if _proc_endpoint(fields[1]) == local and _proc_endpoint(fields[2]) == remote:
@@ -258,7 +260,11 @@ def _endpoint_pair(pair) -> Optional[tuple]:
 
 
 def _proc_net_tables() -> list[str]:
-    """Text of ``/proc/net/tcp`` and ``/proc/net/tcp6``; a table that cannot be read is left out."""
+    """Text of ``/proc/net/tcp`` and ``/proc/net/tcp6``; a table that cannot be read is left out.
+
+    Both are needed: a client's socket is AF_INET or AF_INET6 by the client's own choice, and the
+    server's address does not reveal which (a dual-stack server sees an IPv4 client as ``::ffff:``).
+    """
     tables = []
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
@@ -277,8 +283,9 @@ class PeerUidGate:
     runs. Gated mode is exempt: it withholds the token, and a loopback reverse proxy may run as
     another account.
 
-    # ponytail: reads /proc on every loopback request (cost grows with the socket table); cache
-    # per (client, server) port pair if profiling shows it.
+    # ponytail: reads both /proc tables per loopback request, in a thread (cost grows with the socket
+    # count). A per-port cache is unsafe: a closed port reused by a foreign account would inherit the
+    # cached owner. Upgrade path: netlink sock_diag lookup by the 4-tuple.
     """
 
     def __init__(self, app) -> None:
@@ -297,7 +304,8 @@ class PeerUidGate:
         ):
             await self.app(scope, receive, send)
             return
-        if proc_net_socket_uid(client, scope.get("server"), _proc_net_tables()) == os.getuid():
+        tables = await asyncio.to_thread(_proc_net_tables)
+        if proc_net_socket_uid(client, scope.get("server"), tables) == os.getuid():
             await self.app(scope, receive, send)
             return
         if scope["type"] == "websocket":
