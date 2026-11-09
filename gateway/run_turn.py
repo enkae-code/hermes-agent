@@ -437,16 +437,20 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         """Enabled toolsets for an agent run, honoring an adapter ``toolsets_for_source()`` override
         validated through the SAME ``_get_platform_tools`` path (unknown / platform-restricted
         toolsets dropped, not trusted)."""
-        from hermes_cli.tools_config import _get_platform_tools
+        from hermes_cli.tools_config import _get_platform_tools, _get_plugin_toolset_keys
         try:
             adapter = self._delivery_adapter_for(source)
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
         if override and isinstance(override, list):
+            # An override is exhaustive: mark every plugin toolset as "known" for this platform so
+            # _enabled_plugin_toolsets drops the ones the override does not name.
             pts = dict(user_config.get("platform_toolsets") or {})
             pts[platform_key] = [str(x) for x in override]
-            user_config = {**user_config, "platform_toolsets": pts}
+            known = dict(user_config.get("known_plugin_toolsets") or {})
+            known[platform_key] = sorted(_get_plugin_toolset_keys())
+            user_config = {**user_config, "platform_toolsets": pts, "known_plugin_toolsets": known}
         return sorted(_get_platform_tools(user_config, platform_key))
 
     def _resolve_turn_toolsets(self, user_config: dict, source: SessionSource, platform_key: str):

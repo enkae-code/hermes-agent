@@ -133,6 +133,38 @@ class TestGatewayResolveEnabledToolsetsForSource:
         )
         assert res == sorted(_get_platform_tools(BASE_CONFIG, "webhook"))
 
+    def test_override_excludes_unnamed_plugin_toolsets(self, monkeypatch):
+        import hermes_cli.tools_config as tc
+        monkeypatch.setattr(tc, "_get_plugin_toolset_keys", lambda: {"omh", "headroom"})
+        wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal"]}})
+        gr = _make_runner(wa)
+        res = GatewayRunner._resolve_enabled_toolsets_for_source(
+            gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
+        )
+        assert "terminal" in res
+        assert "omh" not in res and "headroom" not in res
+
+    def test_override_naming_plugin_toolset_keeps_it(self, monkeypatch):
+        import hermes_cli.tools_config as tc
+        monkeypatch.setattr(tc, "_get_plugin_toolset_keys", lambda: {"omh", "headroom"})
+        wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal", "omh"]}})
+        gr = _make_runner(wa)
+        res = GatewayRunner._resolve_enabled_toolsets_for_source(
+            gr, BASE_CONFIG, _Src("webhook:mon:d"), "webhook"
+        )
+        assert "omh" in res
+        assert "headroom" not in res
+
+    def test_no_override_keeps_plugin_toolsets(self, monkeypatch):
+        import hermes_cli.tools_config as tc
+        monkeypatch.setattr(tc, "_get_plugin_toolset_keys", lambda: {"omh"})
+        wa = _make_adapter({"plain": {"secret": "x"}})
+        gr = _make_runner(wa)
+        res = GatewayRunner._resolve_enabled_toolsets_for_source(
+            gr, BASE_CONFIG, _Src("webhook:plain:d"), "webhook"
+        )
+        assert "omh" in res
+
     def test_original_config_not_mutated(self):
         cfg = {"platform_toolsets": {"webhook": ["web"]}}
         wa = _make_adapter({"mon": {"secret": "x", "toolsets": ["terminal"]}})
