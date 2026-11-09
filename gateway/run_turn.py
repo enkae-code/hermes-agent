@@ -443,15 +443,23 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
-        if override and isinstance(override, list):
+        drop_context_engine = False
+        if isinstance(override, list) and override:
             # An override is exhaustive: mark every plugin toolset as "known" for this platform so
             # _enabled_plugin_toolsets drops the ones the override does not name.
+            names = [str(x) for x in override]
             pts = dict(user_config.get("platform_toolsets") or {})
-            pts[platform_key] = [str(x) for x in override]
+            pts[platform_key] = names
             known = dict(user_config.get("known_plugin_toolsets") or {})
             known[platform_key] = sorted(_get_plugin_toolset_keys())
             user_config = {**user_config, "platform_toolsets": pts, "known_plugin_toolsets": known}
-        return sorted(_get_platform_tools(user_config, platform_key))
+            drop_context_engine = "context_engine" not in names
+        resolved = set(_get_platform_tools(user_config, platform_key))
+        # _get_platform_tools adds context_engine to any explicit list when a non-default engine is
+        # set; an exhaustive override must not gain it unless it names it.
+        if drop_context_engine:
+            resolved.discard("context_engine")
+        return sorted(resolved)
 
     def _resolve_turn_toolsets(self, user_config: dict, source: SessionSource, platform_key: str):
         """``(enabled_toolsets, disabled_toolsets)`` for an agent run on ``source``."""

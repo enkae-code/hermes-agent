@@ -181,7 +181,8 @@ class GatewaySessionAgentMixin:
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=not bool(policy and policy.ignore_rules),
-            skip_memory=bool(policy and policy.ignore_rules),
+            # Bot-sourced turns never see private memory (MEMORY.md/USER.md or the external provider).
+            skip_memory=bool(policy and policy.ignore_rules) or bool(getattr(src, "is_bot", False)),
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.

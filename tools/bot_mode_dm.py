@@ -42,6 +42,7 @@ MESSAGE_AGENT_TOOL_NAME = "message_agent"
 # Message body cap — generous for real work, small enough that a runaway paste can't
 # turn one DM into a context bomb on the recipient.
 MESSAGE_MAX_CHARS = 16000
+_BOT_TURN_TOOLSETS = frozenset({"bot_room", "no_mcp"})
 # The delivery process's completion notification IS the reply: size it like a message, plus the
 # runner's header and failure prose, instead of the 2000-char tail a build log gets.
 REPLY_COMPLETION_CHARS = MESSAGE_MAX_CHARS + 2000
@@ -133,6 +134,13 @@ def message_agent_authorized(agent: Any) -> bool:
             return False
         from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
 
+        # message_agent has no toolset of its own, so the only signal left is the toolset list. An
+        # admitted bot turn (toolsets_for_source) carries bot_room/no_mcp; its session title is
+        # attacker-steerable, so such an agent must never reach message_agent.
+        # ponytail: name-based denylist; add an explicit build marker if other override names appear.
+        enabled = set(getattr(agent, "enabled_toolsets", None) or ())
+        if enabled & _BOT_TURN_TOOLSETS:
+            return False
         # Managed-install check, NOT section non-emptiness: a SOUL.md carrying the
         # legacy protocol text gets an empty section but must still get the tool.
         return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))

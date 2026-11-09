@@ -1329,3 +1329,13 @@ def test_poll_reply_is_persisted_as_a_delivery_row_when_the_runner_exits(tmp_pat
     assert kw["display_kind"] == "process_complete"
     assert "PAYLOAD_SENTINEL_42" in kw["content"]
     assert procs[0].id in kw["content"]
+
+
+def test_message_agent_refused_for_admitted_bot_turn(tmp_path):
+    """A bot-sourced turn (bot_room override) on a managed install titled 'Bot Chat' must not be authorized."""
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+    agent.enabled_toolsets = ["bot_room", "no_mcp"]
+    assert bot_mode_dm.message_agent_authorized(agent) is False
+    agent.enabled_toolsets = ["web"]
+    assert bot_mode_dm.message_agent_authorized(agent) is True

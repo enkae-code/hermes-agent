@@ -221,3 +221,14 @@ class TestToolsetsBindToAuthenticatedRoute:
         res = await self._dispatch("/webhooks/build", "strong-secret", "external:d1")
         assert "terminal" in res and "file" in res
         assert "web" not in res
+
+
+def test_override_drops_context_engine_unless_named():
+    # A non-default context engine must not leak its tools into an exhaustive override.
+    cfg = {**BASE_CONFIG, "context": {"engine": "lcm"}}
+    gr = _make_runner(_make_adapter({"mon": {"secret": "x", "toolsets": ["web"]}}))
+    res = GatewayRunner._resolve_enabled_toolsets_for_source(gr, cfg, _Src("webhook:mon:d"), "webhook")
+    assert "web" in res and "context_engine" not in res
+    gr = _make_runner(_make_adapter({"mon": {"secret": "x", "toolsets": ["web", "context_engine"]}}))
+    res = GatewayRunner._resolve_enabled_toolsets_for_source(gr, cfg, _Src("webhook:mon:d"), "webhook")
+    assert "context_engine" in res
