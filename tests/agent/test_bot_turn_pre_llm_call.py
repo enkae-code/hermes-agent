@@ -17,6 +17,12 @@ def _collect(agent, blocks=None):
         messages=[], conversation_history=[], blocks=blocks)
 
 
+def test_init_path_keeps_bot_turn_on_the_agent():
+    from run_agent import AIAgent
+    agent = AIAgent(model="gpt-4o", api_key="k", base_url="http://127.0.0.1:9/v1", quiet_mode=True, bot_turn=True)
+    assert agent.bot_turn is True
+
+
 def test_bot_turn_does_not_invoke_pre_llm_call_hook():
     with patch("hermes_cli.lifecycle.invoke_hook", return_value=[{"context": "PRIVATE"}]) as hook:
         assert _collect(_agent(bot_turn=True)) == ""

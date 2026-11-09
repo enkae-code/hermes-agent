@@ -43,6 +43,36 @@ def test_human_source_keeps_context_files_and_turn_flag_off(monkeypatch):
     assert built["bot_turn"] is False
 
 
+def _resolve_kwargs(monkeypatch, *, is_bot):
+    monkeypatch.setattr(session_policy, "policy_for_source", lambda runner, source: None)
+    monkeypatch.setattr(GatewaySessionAgentMixin, "_build_fresh_agent", lambda self, *a: "agent")
+    signature = {}
+
+    def agent_config_signature(*args, **kwargs):
+        signature.update(kwargs)
+        return "sig"
+
+    turn = GatewaySessionAgentMixin.__new__(GatewaySessionAgentMixin)
+    turn._runner = SimpleNamespace(_agent_config_signature=agent_config_signature,
+                                   _extract_cache_busting_config=lambda cfg: {}, _session_db=None)
+    source = SimpleNamespace(user_id="u", user_id_alt=None, is_bot=is_bot)
+    turn._ctx = SimpleNamespace(source=source, user_config={}, enabled_toolsets=["bot_room"],
+                                session_id="s", session_key="k", interim_assistant_messages_enabled=False)
+    turn._resolve_turn_agent({"model": "m", "runtime": {}}, "fluxer", None, 1, None, {})
+    return signature
+
+
+def test_resolve_turn_agent_signs_bot_source_as_bot_turn(monkeypatch):
+    signature = _resolve_kwargs(monkeypatch, is_bot=True)
+    assert signature.get("bot_turn") is True
+    assert signature.get("skip_context_files") is True
+
+
+def test_resolve_turn_agent_signs_human_source_as_not_bot_turn(monkeypatch):
+    signature = _resolve_kwargs(monkeypatch, is_bot=False)
+    assert signature.get("bot_turn") is False
+
+
 def test_bot_turn_has_its_own_cached_agent_signature():
     from gateway.run import GatewayRunner
     args = ("m", {"api_key": "k"}, ["bot_room"], "")
