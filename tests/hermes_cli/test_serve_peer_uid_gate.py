@@ -197,7 +197,8 @@ def test_gated_mode_is_not_checked(serve_app, monkeypatch):
     from fastapi.testclient import TestClient
 
     _set_owner(monkeypatch, boundary, os.getuid() + 1)
-    monkeypatch.setattr(serve_app.app.state, "auth_required", True, raising=False)
+    # setitem on the backing dict: setattr's undo would delattr a key State never had.
+    monkeypatch.setitem(serve_app.app.state._state, "auth_required", True)
     client = TestClient(serve_app.app, client=("127.0.0.1", 40000), base_url="http://127.0.0.1:9119")
     resp = client.get("/api/status")
     assert resp.status_code != 403
