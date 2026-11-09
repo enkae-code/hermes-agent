@@ -1335,7 +1335,7 @@ def test_message_agent_refused_for_admitted_bot_turn(tmp_path):
     """A bot-sourced turn (bot_room override) on a managed install titled 'Bot Chat' must not be authorized."""
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
-    agent.enabled_toolsets = ["bot_room", "no_mcp"]
+    agent.enabled_toolsets = ["bot_room"]
     assert bot_mode_dm.message_agent_authorized(agent) is False
     agent.enabled_toolsets = ["web"]
     assert bot_mode_dm.message_agent_authorized(agent) is True

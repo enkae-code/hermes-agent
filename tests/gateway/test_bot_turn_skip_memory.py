@@ -29,3 +29,22 @@ def test_bot_source_builds_with_skip_memory(monkeypatch):
 
 def test_human_source_keeps_skip_memory_false(monkeypatch):
     assert _build_kwargs(monkeypatch, is_bot=False)["skip_memory"] is False
+
+
+def test_bot_source_skips_context_files_and_flags_turn(monkeypatch):
+    built = _build_kwargs(monkeypatch, is_bot=True)
+    assert built["skip_context_files"] is True
+    assert built["bot_turn"] is True
+
+
+def test_human_source_keeps_context_files_and_turn_flag_off(monkeypatch):
+    built = _build_kwargs(monkeypatch, is_bot=False)
+    assert built["skip_context_files"] is False
+    assert built["bot_turn"] is False
+
+
+def test_bot_turn_has_its_own_cached_agent_signature():
+    from gateway.run import GatewayRunner
+    args = ("m", {"api_key": "k"}, ["bot_room"], "")
+    assert GatewayRunner._agent_config_signature(*args, bot_turn=True) != \
+        GatewayRunner._agent_config_signature(*args, bot_turn=False)

@@ -855,7 +855,8 @@ def _collect_pre_llm_call_context(
     runaway plugin can't inflate every subsequent turn's prompt. Each
     ``{"action": "block", "message": ...}`` veto is appended to ``blocks`` (#57364); one
     without a message is ignored, as for ``pre_tool_call``."""
-    if getattr(agent, "_persist_disabled", False):
+    # Bot-sourced turns get no plugin context: a plugin's injected state would be echoed to the bot.
+    if getattr(agent, "_persist_disabled", False) or getattr(agent, "bot_turn", False):
         return ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook

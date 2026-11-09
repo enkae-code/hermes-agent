@@ -2141,7 +2141,7 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
-    side_agent: bool = False, memory_manager=None,
+    side_agent: bool = False, memory_manager=None, bot_turn: bool = False,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
     from agent.safe_worker_policy import safe_worker_enabled

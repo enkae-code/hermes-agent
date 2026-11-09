@@ -154,6 +154,7 @@ class GatewaySessionAgentMixin:
         ctx = self._ctx
         runner = self._runner
         src = ctx.source
+        is_bot = bool(getattr(src, "is_bot", False))
         from gateway.session_authorities import active_authority
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
@@ -178,11 +179,12 @@ class GatewaySessionAgentMixin:
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
             fallback_model=None if api_runtime_locked() else self._runner._refresh_fallback_model(),
-            skip_context_files=skip_context_files,
+            skip_context_files=bool(skip_context_files) or is_bot,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=not bool(policy and policy.ignore_rules),
             # Bot-sourced turns never see private memory (MEMORY.md/USER.md or the external provider).
-            skip_memory=bool(policy and policy.ignore_rules) or bool(getattr(src, "is_bot", False)),
+            skip_memory=bool(policy and policy.ignore_rules) or is_bot,
+            bot_turn=is_bot,
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.
@@ -194,13 +196,14 @@ class GatewaySessionAgentMixin:
         hits) or build a fresh one. Returns (agent, reused_cached_agent)."""
         ctx = self._ctx
         runner = self._runner
-        skip_context_files = self._skip_context_files(platform_key)
+        is_bot = bool(getattr(ctx.source, "is_bot", False))
+        skip_context_files = self._skip_context_files(platform_key) or is_bot
         sig = runner._agent_config_signature(
             turn_route["model"], turn_route["runtime"], ctx.enabled_toolsets, combined_ephemeral,
             cache_keys=runner._extract_cache_busting_config(ctx.user_config),
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
-            skip_context_files=skip_context_files,
+            skip_context_files=skip_context_files, bot_turn=is_bot,
         )
         cache_lock = getattr(runner, "_agent_cache_lock", None)
         cache = getattr(runner, "_agent_cache", None)
