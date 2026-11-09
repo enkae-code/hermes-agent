@@ -7,10 +7,14 @@ DNS-rebinding Host check and gate decision. ``hermes_cli.web_server`` and
 ``hermes_cli.web_server_chat`` re-export these names, so ``web_server.<name>`` keeps working.
 """
 
+import ipaddress
 import os
 import re
+import sys
 import urllib.parse
 from typing import Optional
+
+from starlette.responses import JSONResponse
 
 # Accepted Host values for loopback binds. DNS rebinding TTL-flips an attacker
 # hostname to 127.0.0.1 so the browser treats it as same-origin; validating Host
@@ -192,6 +196,115 @@ def ws_client_reason(ws, state) -> Optional[str]:
     if client_host in _LOOPBACK_HOSTS:
         return None
     return f"peer_not_loopback peer={client_host} bound={bound_host or '?'}"
+
+
+def _fold_ip(addr):
+    """IPv4-mapped IPv6 (``::ffff:a.b.c.d``) as the IPv4 address it names."""
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def _endpoint_ip(host: str):
+    """``ipaddress`` object for an IP literal, or None (hostnames, ``testclient``, empty)."""
+    try:
+        return _fold_ip(ipaddress.ip_address(host))
+    except ValueError:
+        return None
+
+
+def _proc_endpoint(field: str) -> tuple:
+    """``(ip, port)`` from a ``/proc/net/tcp{,6}`` ``ADDR:PORT`` field.
+
+    The kernel prints each 32-bit word of the address as a little-endian hex integer, so every
+    4-byte group is reversed (one group for IPv4, four for IPv6).
+    """
+    ip_hex, port_hex = field.split(":")
+    raw = bytes.fromhex(ip_hex)
+    packed = raw[::-1] if len(raw) == 4 else b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+    return _fold_ip(ipaddress.ip_address(packed)), int(port_hex, 16)
+
+
+def proc_net_socket_uid(client, server, tables) -> Optional[int]:
+    """Owner uid of the TCP socket whose local end is *client* and remote end is *server*, else None.
+
+    *tables* is the text of ``/proc/net/tcp`` and ``/proc/net/tcp6``; the caller reads them. Pure, so
+    the parser is testable without a live socket. None means "not found": callers fail closed.
+    """
+    local = _endpoint_pair(client)
+    remote = _endpoint_pair(server)
+    if local is None or remote is None:
+        return None
+    for table in tables:
+        for line in table.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 8:
+                continue
+            try:
+                if _proc_endpoint(fields[1]) == local and _proc_endpoint(fields[2]) == remote:
+                    return int(fields[7])
+            except ValueError:
+                continue
+    return None
+
+
+def _endpoint_pair(pair) -> Optional[tuple]:
+    try:
+        host, port = pair
+    except (TypeError, ValueError):
+        return None
+    ip = _endpoint_ip(host)
+    return None if ip is None else (ip, port)
+
+
+def _proc_net_tables() -> list[str]:
+    """Text of ``/proc/net/tcp`` and ``/proc/net/tcp6``; a table that cannot be read is left out."""
+    tables = []
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path, encoding="ascii") as handle:
+                tables.append(handle.read())
+        except OSError:
+            pass
+    return tables
+
+
+class PeerUidGate:
+    """Refuse a loopback TCP client whose socket belongs to another Unix account (Linux only).
+
+    ``hermes serve`` on a shared host serves its session token to any local account that GETs ``/``.
+    Refused HTTP requests get 403 and refused WebSockets close (4403) before accept, so no route
+    runs. Gated mode is exempt: it withholds the token, and a loopback reverse proxy may run as
+    another account.
+
+    # ponytail: reads /proc on every loopback request (cost grows with the socket table); cache
+    # per (client, server) port pair if profiling shows it.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        client = scope.get("client")
+        if (
+            scope["type"] not in ("http", "websocket")
+            or scope.get("hermes_in_process")  # set only by the in-process self-test; never by a socket
+            or sys.platform != "linux"
+            or not client
+            or (ip := _endpoint_ip(client[0])) is None
+            or not ip.is_loopback
+            or getattr(scope["app"].state, "auth_required", False)
+        ):
+            await self.app(scope, receive, send)
+            return
+        if proc_net_socket_uid(client, scope.get("server"), _proc_net_tables()) == os.getuid():
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 4403})
+            return
+        response = JSONResponse({"detail": "Forbidden: the session belongs to another local account."}, status_code=403)
+        await response(scope, receive, send)
 
 
 # CORS: this backend's own loopback origin (the port actually bound) and the desktop dev renderer it

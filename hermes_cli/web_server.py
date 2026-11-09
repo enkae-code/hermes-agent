@@ -357,6 +357,7 @@ from hermes_cli.web_server_boundary import (  # re-exported: web_server.<name> s
     _dashboard_public_origins,
     _desktop_loopback_auth_exempt,
     _host_header_hostname,
+    PeerUidGate,
     _is_accepted_host,
     public_hosts_engage_gate,
     public_url_hosts,
@@ -580,6 +581,8 @@ class _LocalOriginCORSMiddleware(CORSMiddleware):
 # Without this, an OPTIONS preflight from a cross-origin SPA hits the auth
 # middlewares before CORS can answer, producing 401 instead of 204 + headers.
 app.add_middleware(_LocalOriginCORSMiddleware, allow_methods=["*"], allow_headers=["*"])
+# Added last so it is outermost: a foreign-uid peer is refused before CORS, auth or any route.
+app.add_middleware(PeerUidGate)
 
 
 # Authenticated-route self-test: one in-process request per minute against a
@@ -595,8 +598,13 @@ async def _dashboard_selftest_once() -> None:
     except ImportError:
         return  # optional dependency — leave status "unknown"
     try:
+        async def in_process(scope, receive, send):
+            # No socket here: PeerUidGate has no owner to check and would refuse this fake client.
+            await app(scope | {"hermes_in_process": True}, receive, send)
+
         # Loopback base_url so the Host-header middleware accepts the request.
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        transport = httpx.ASGITransport(app=in_process)
+        async with httpx.AsyncClient(transport=transport, base_url="http://127.0.0.1") as client:
             resp = await client.get(_DASHBOARD_SELFTEST_ROUTE, headers={_SESSION_HEADER_NAME: _SESSION_TOKEN})
         DASHBOARD_HEALTH.record_selftest(resp.status_code == 200, resp.status_code)
     except Exception:

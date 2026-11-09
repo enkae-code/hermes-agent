@@ -1,18 +1,21 @@
 """Body budgets apply before parsing public auth requests, not to uploads."""
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 
 import pytest
 from fastapi import FastAPI
 from starlette.types import Message, Scope
 
-from hermes_cli import web_server
+from hermes_cli import web_server, web_server_boundary
 
 
 @pytest.fixture
 def app(monkeypatch: pytest.MonkeyPatch) -> Iterator[FastAPI]:
     monkeypatch.setattr(web_server.app.state, "bound_host", None, raising=False)
+    # _request fakes a loopback peer with no socket behind it: treat it as owned by this account.
+    monkeypatch.setattr(web_server_boundary, "proc_net_socket_uid", lambda *_: os.getuid())
     application = FastAPI(middleware=web_server.app.user_middleware)
     application.state.auth_required = True
     application.state.calls = 0
