@@ -224,8 +224,9 @@ This one constraint eliminates more generic-looking UI than any aesthetic rule b
    - Motion: timeline or state-based animation.
 
 6. **Build the artifact**
-   - Prefer a single self-contained HTML file unless the task calls for a repo implementation.
+   - Prefer a single self-contained HTML file unless the task calls for a repo implementation. If the mockup uses local images or other assets, inline them or package and verify the complete asset set so the delivered artifact still renders from its final location without relying on the builder's working directory.
    - Preserve prior versions for major revisions.
+   - When iterating an existing artifact, ask for localized edits to the relevant sections instead of a full-file rewrite; this preserves verified behavior and avoids response-size stalls. Inspect the resulting diff and render before accepting the iteration.
    - Avoid unnecessary dependencies.
 
 7. **Verify**

@@ -94,7 +94,11 @@ in a draft — reusing the ledger keeps the numbering stable.
 `web_extract` / `browser_exec` / fetch, pass the URLs to `sources.py add`
 (or pipe the raw JSON through `sources.py ingest`). Do this *before* writing
 prose. Registering later, from memory, is the failure mode this skill exists to
-prevent.
+prevent. Treat a synthesized report or bot-generated dossier as a secondary
+source: its listed URLs are leads, not evidence that those pages were read.
+Retrieve and register primary pages before relying on their claims; if the
+artifact is ephemeral, preserve its text and record its provenance and the
+verification status separately.
 
 ③ **Write cite-while-drafting.** Place the bracketed id(s) immediately after
 each sentence the source supports:

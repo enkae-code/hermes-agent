@@ -48,7 +48,7 @@ Use these dispositions:
 | reference | Useful information with no action |
 | noise | Automated or irrelevant mail safe to archive under the approved policy |
 
-Extract sender request, deadline, commitments already made, attachments, and missing information. Done when every surfaced thread has a disposition and a stated reason.
+Extract sender request, deadline, commitments already made, attachments, and missing information. For money, eligibility, refunds, and deadlines, verify each amount and date against the actual message or authoritative referenced record; don't infer an amount, payout timing, or remaining balance from a general policy window or nearby context. Separate what the sender explicitly offered from what is merely possible, and state uncertainty rather than turning an inference into a fact. Done when every surfaced thread has a disposition and a stated reason, and consequential details are source-checked.
 
 ### 4. Calibrate the user's voice, then draft replies in thread context
 
@@ -83,6 +83,7 @@ Send, label, archive, or create follow-ups only within approval. For ambiguous s
 - Treating unread as synonymous with important.
 - Missing earlier unanswered questions in a long thread.
 - Drafting in a generic-professional voice instead of calibrating against the user's own sent replies.
+- Reporting a refund amount, expected arrival date, or implied available balance that the actual message/record does not confirm; a policy range is not an individual payout estimate.
 - Treating a missing `Sent` folder as inaccessible: providers name it `Sent`, `Sent Messages`, `[Gmail]/Sent Mail`, or a localized name — list folders before declaring the fallback.
 - Retrying after SMTP succeeded but save-to-Sent failed, causing duplicate mail.
 - Claiming inbox zero when pagination or another folder was omitted.
