@@ -62,6 +62,14 @@ hermes skills tap add REPO  Add a GitHub repo as a skill source
 hermes bundles              Skill bundles (one /<name> alias loads several skills)
 ```
 
+### Updating a plugin
+
+1. Identify the active profile and exact installed plugin name; run `hermes plugins check-updates` and confirm that this plugin has an update before changing anything.
+2. Inspect the installed plugin for local edits and record its current version/SHA. Preserve a recoverable copy if it is locally modified or rollback would otherwise be difficult; do not overwrite unreconciled local work.
+3. Update only the named plugin with `hermes plugins update <name>`, not the whole catalog. Then read the installed metadata and inspect the expected changed capability or code path; a success message alone is not verification.
+4. Run the plugin's relevant tests. If tests fail, compare the same failing test against the pre-update version before attributing the failure to the update. Report baseline failures separately; do not call a skipped or failed test passing.
+5. If the changed plugin is loaded by a long-lived gateway, establish whether reload or restart is required. Verify the real runtime after an authorized restart; on shared or interruptive services, do not restart without the operator's consent.
+
 ### MCP Servers
 
 ```
@@ -80,6 +88,22 @@ hermes gateway run|install|start|stop|restart|status|setup
 
 20+ platforms: Telegram, Discord, Slack, WhatsApp (Baileys + Business Cloud API), iMessage (Photon — `hermes photon setup`), Signal, Email, SMS, Matrix, Mattermost, Teams, LINE, SimpleX, ntfy, Google Chat, Home Assistant, DingTalk, Feishu, WeCom, Weixin, API Server, Webhooks. Open WebUI connects via the API Server adapter. Most adapters ship under `plugins/platforms/`.
 Docs: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/
+
+##### Moving a gateway to another host
+
+1. Inventory the source and destination before copying: active profile, gateway configuration and platform credentials, cron jobs, plugins/MCP servers, skills, memory/session data, auxiliary services and their databases. Preserve a rollback copy and keep secrets out of command output and logs.
+2. Copy persistent user data while both gateway owners are stopped or otherwise quiesced. Do not transfer live runtime ownership artifacts (PID files, sockets, or gateway state files); they describe the source process, not the destination. Start the destination once, then verify service health and each real messaging/integration path there.
+3. Before disabling the source, inspect every launch path. Disabling its systemd service is not sufficient when a client such as Hermes Desktop can run `hermes gateway ensure` and spawn a local gateway on demand. Check the actual client backend/connection mode and verify which host owns the live gateway after opening the client.
+4. Prevent duplicate scheduled work and messages during transition: establish which host owns cron execution and platform credentials, and ensure the other copy cannot run the same jobs or connect as the same bot. Preserve the source configuration for rollback rather than deleting it.
+5. Treat a cutover as incomplete until the destination has been exercised through the actual client and external integration, and the source is confirmed not to be processing. Keep rollback bounded and restore the source's services, credentials and scheduled jobs together.
+
+Concrete recipe (source-fact capture, venv rebuilds, disabled units, detached cutover with health poll and rollback, bandwidth-safe pre-copy, desktop switcher semantics, tunnel-only backend→frontend SSH, post-move capability audit): `references/gateway-host-migration.md`.
+
+Do not claim that a cutover script, copied login state, or a green service status proves the migration worked; verify the live client connection and external behavior. When the destination setup or rollback path has not been exercised, state that the cutover remains pending rather than handing over an unverified command as completed work.
+
+#### Discovering third-party platform adapters
+
+Before saying Hermes lacks an adapter or recommending a platform switch, check in this order: (1) the live Hermes official plugin catalog/docs, (2) the installed Hermes source's `plugin-catalog/` and plugin registry, then (3) repository search for adapter implementations. Search both platform and project terms (for example, `Fluxer Hermes Agent`); an integration can exist as a community plugin even when absent from the core supported-platform list. Read the candidate's README, manifest and setup instructions; verify required Hermes hooks/API compatibility against the current adapter/plugin docs before recommending installation. Distinguish catalog-listed, repository-found, installed, and runtime-tested states—discovery is not proof the plugin works in this environment. Compare a bundled platform (such as Slack) with a community adapter on concrete capabilities, maintenance signals, permission model and setup burden; do not equate "more integrated" with "better fit" or recommend switching without explaining the trade-off. Treat star counts and repository activity as weak maturity signals, not security or reliability evidence; review code and scopes before handling credentials or granting permissions.
 
 ### Sessions
 

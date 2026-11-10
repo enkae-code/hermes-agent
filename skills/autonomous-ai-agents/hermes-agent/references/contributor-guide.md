@@ -96,6 +96,8 @@ scripts/run_tests.sh -v --tb=long             # pass-through pytest flags
 ```
 
 - Tests auto-redirect `HERMES_HOME` to temp dirs — never touch real `~/.hermes/`.
+- For direct test runs from an activated Hermes development environment, preserve the project's dependency paths and unset any inherited `HERMES_HOME` only when the repo's test fixture establishes its own isolated home; inspect setup/teardown errors rather than treating them as product failures. When a helper imports Hermes source modules, run it through the repository's supported environment/bootstrap rather than a bare isolated Python (`-I` ignores `PYTHONPATH` and can hide the dependencies Hermes normally initializes); confirm the helper resolves imports from the intended checkout, especially when using a worktree. Capture pytest's actual exit code directly—avoid `| tail` unless `pipefail` is enabled.
+- An uncommitted candidate is lost if the worktree is removed after a failed commit; uncommitted `git add` blobs can be recovered with `find .git/objects -mmin -N` + `git cat-file`.
 - Prepare Python through the PM developer workflow before building a test environment.
 - Run `python -m pm.build_env --source . --out .venv --group dev --group test`.
   The output must not exist. Stop its processes and intentionally remove only
@@ -110,6 +112,25 @@ scripts/run_tests.sh -v --tb=long             # pass-through pytest flags
 Host-specific tests run on the real host. Use one `@pytest.mark.platforms(...)`
 marker per test, such as `@pytest.mark.platforms("windows", arch="arm64")`.
 Do not fake the host by patching `sys.platform` or platform probes.
+
+For upstream contributions from a local fork, preserve a recovery point on
+your fork before rebuilding the change against current upstream. Use a separate
+worktree/branch for the upstream PR so local deployment commits and PR history
+do not get mixed. After applying the minimal fix, run the same canonical test
+and static-gate commands on both the PR tree and a clean worktree at its exact
+upstream base whenever failures appear. Compare failing test identities and
+static findings, not just exit codes; baseline failures are not regressions,
+and a PR-only health/line-budget failure still needs fixing even when tests pass.
+Re-run the affected test after any structural move made to satisfy a file-size
+budget, then review the final diff and branch base before publishing.
+
+Before integrating an approved fix into a long-lived deployment branch, fetch
+its current remote tip and inspect every commit since the fix's recorded base.
+If the new commits are disjoint from the fix, rebase the fix onto the new tip,
+rerun the affected focused tests, then fast-forward the deployment branch and
+push; this preserves intervening work while keeping the integration linear.
+If changes overlap or their interaction is unclear, stop and reconcile rather
+than forcing a merge or rewriting the deployment branch.
 
 ### System prompt's execution-environment block
 

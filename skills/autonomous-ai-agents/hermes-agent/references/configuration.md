@@ -79,6 +79,8 @@ Auto-detect priority: local faster-whisper (`python -c "import pm; pm.sync_venv(
 
 ### TTS (Text → Voice)
 
+For wiring an OpenAI-compatible remote TTS service, including a localhost SSH tunnel and end-to-end verification, follow `references/voice-tts-custom-endpoint.md`.
+
 | Provider | Env var | Free? |
 |----------|---------|-------|
 | Edge TTS (default) | None | Yes |
@@ -89,4 +91,4 @@ Auto-detect priority: local faster-whisper (`python -c "import pm; pm.sync_venv(
 | Gemini | `GOOGLE_API_KEY` | Free tier |
 | NeuTTS / Piper / KittenTTS (local) | None | Free |
 
-Voice commands: `/voice on` (voice-to-voice), `/voice tts` (always voice), `/voice off`.
+Voice commands: `/voice on` (voice-to-voice), `/voice tts` (always voice), `/voice off`. These are CLI/gateway slash commands — the desktop chat input does NOT route them (they arrive as plain text).
