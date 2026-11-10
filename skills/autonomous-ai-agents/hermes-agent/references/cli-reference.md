@@ -97,7 +97,7 @@ Docs: https://hermes-agent.nousresearch.com/docs/user-guide/messaging/
 4. Prevent duplicate scheduled work and messages during transition: establish which host owns cron execution and platform credentials, and ensure the other copy cannot run the same jobs or connect as the same bot. Preserve the source configuration for rollback rather than deleting it.
 5. Treat a cutover as incomplete until the destination has been exercised through the actual client and external integration, and the source is confirmed not to be processing. Keep rollback bounded and restore the source's services, credentials and scheduled jobs together.
 
-Concrete recipe (source-fact capture, venv rebuilds, disabled units, detached cutover with health poll and rollback, bandwidth-safe pre-copy, desktop switcher semantics, tunnel-only backend→frontend SSH, post-move capability audit): `references/gateway-host-migration.md`.
+Concrete recipe (source-fact capture, venv rebuilds, disabled units, detached cutover with health poll and rollback, bandwidth-safe pre-copy, desktop switcher semantics): `references/gateway-host-migration.md`.
 
 Do not claim that a cutover script, copied login state, or a green service status proves the migration worked; verify the live client connection and external behavior. When the destination setup or rollback path has not been exercised, state that the cutover remains pending rather than handing over an unverified command as completed work.
 
