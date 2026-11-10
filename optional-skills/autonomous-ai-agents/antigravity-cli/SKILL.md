@@ -72,21 +72,28 @@ fixes, reviews, second opinions) to Antigravity rather than just smoke-testing.
 ### One-shot (preferred for scripted prompts and second opinions)
 
 ```
-terminal(command="agy -p 'Review this diff for bugs and security issues' --model 'Gemini 3.1 Pro (High)'", workdir="/path/to/repo", timeout=300)
+terminal(command="agy -p 'Review this diff for bugs and security issues' --model gemini-3.8-flash-high --sandbox --print-timeout 4m", workdir="/path/to/repo", timeout=300)
 ```
 
 `-p` is non-interactive: it runs the prompt and exits. Pick the engine with
-`--model` (run `agy models` for the exact display strings, e.g.
-`'Gemini 3.1 Pro (High)'`, `'Claude Opus 4.6 (Thinking)'`). Add extra context
-roots with repeatable `--add-dir`.
+`--model` (run `agy models` and pin the listed model ID; display labels and
+available IDs can change). Add extra context
+roots with repeatable `--add-dir`. Prefer invoking `agy` directly from the
+orchestrator; do not build a repo-specific wrapper for model pinning, timeouts,
+process control, diff checks, or acceptance gates that the orchestrator can own.
+Add a wrapper only for a demonstrated capability gap that cannot be handled by
+the native CLI and existing orchestration tools. Pass task text with correct
+shell quoting or through a safe file/stdin mechanism; never interpolate
+untrusted task text into a double-quoted shell command where substitutions can
+execute.
 
 ### Long / bounded runs (tests, builds, multi-file changes)
 
 Background it and get notified on completion, the same as the `codex` skill:
 
 ```
-terminal(command="agy -p 'Implement the change described in TASK.md and run the tests' --dangerously-skip-permissions", workdir="/path/to/repo", background=true, notify_on_complete=true)
-# then: process(action="poll"/"log"/"wait", session_id=<id>)
+terminal(command="agy -p 'Implement the change described in TASK.md and run the tests' --model <listed-model-id> --mode accept-edits --sandbox --print-timeout 8m", workdir="/path/to/repo", background=true, notify=true)
+# then: process_manage(action="poll"/"log"/"wait", session_id=<id>)
 ```
 
 ### Interactive multi-turn (PTY + tmux)
@@ -105,12 +112,9 @@ review capacity can absorb.
 
 ### Output + bounding caveat (differs from Claude Code)
 
-- `agy -p` returns **plain text** — there is **no `--output-format json`** and
-  no result envelope with `session_id` / cost / turn count. Parse stdout
-  directly; don't expect a JSON object.
-- There is **no `--max-turns`**. A print run is bounded by **`--print-timeout`**
-  (default `5m`). Raise it for long tasks: `--print-timeout 20m`. Pair with the
-  `terminal` `timeout=` so the outer call doesn't cut the run short.
+- Discover output modes from `agy --help`. Version 1.4.3 lists `--output-format text|json|stream-json`; do not assume a Claude-shaped result envelope or cost receipt.
+- There is no listed `--max-turns`. Version 1.4.3 reports `--print-timeout 0s` by default (unbounded); always set a finite limit such as `8m` and bound the host process too.
+- Headless runs may exit 0 with only a `jetski: no output produced` message because a `command` permission was auto-denied. This is a blocked worker, not success. Inspect the actual diff and checks. Stop on the denial; do not follow a generic suggestion to bypass permissions or silently edit allow-rules. Route through an authorized lane or ask the operator.
 
 ### Orchestration boundary
 
@@ -217,10 +221,8 @@ another agent's plan or diff.
   session-state problems, not browser-only problems.
 - Workspace identity can depend on launch directory and the `.antigravitycli`
   project marker.
-- `agy -p` prints plain text only — no `--output-format json`, no result
-  envelope. Don't try to parse a JSON object out of it (unlike `claude-code`).
-- Bound print runs with `--print-timeout` (default `5m`), not `--max-turns`
-  (which does not exist on `agy`).
+- Discover `--output-format` from current help; do not assume its JSON schema matches Claude's receipt.
+- Set an explicit finite `--print-timeout` and host bound; current help reports an unbounded default. No listed `--max-turns`.
 
 ## Verification
 
