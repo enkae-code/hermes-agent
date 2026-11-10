@@ -22,7 +22,7 @@ Delegate coding tasks to [Codex](https://github.com/openai/codex) via the Hermes
 - PR reviews
 - Batch issue fixing
 
-Requires the codex CLI and a git repository.
+Requires the codex CLI. `codex exec` runs inside a git repository, or anywhere with `--skip-git-repo-check`.
 
 ## Prerequisites
 
@@ -43,7 +43,7 @@ that Codex auth is missing.
 Keep agent-authored writes inside the native writable roots. For a receipt outside the checkout, use the outer CLI's `--output-last-message` capture and ask the worker for a final response, not a file write. Do not broaden sandbox permissions merely to fix reporting.
 
 ```
-terminal(command="codex exec 'Add dark mode toggle to settings'", workdir="~/project", pty=true)
+terminal(command="codex exec 'Add dark mode toggle to settings'", workdir="~/project")
 ```
 
 For a bounded read-only source investigation, feed a reviewed work order on stdin, pin the model and effort, write the final answer to a dedicated artifact, and keep the native sandbox read-only:
@@ -56,24 +56,21 @@ codex exec --model <approved-model> --config 'model_reasoning_effort="high"' \
 
 Bound the run with the process timeout. If it runs in the background, capture its process/session ID and verify the startup log reports the requested model, effort, and read-only sandbox before relying on it. Startup metadata proves routing only: wait for normal completion, inspect the terminal status and actual result artifact, then independently verify any source claims against the frozen candidate. A dispatched or still-running investigation has no findings or verdict yet.
 
-For scratch work (Codex needs a git repo):
+For scratch work, run inside a fresh repo (or pass `--skip-git-repo-check` for an authorized non-repository task):
 ```
-terminal(command="cd $(mktemp -d) && git init && codex exec 'Build a snake game in Python'", pty=true)
+terminal(command="cd $(mktemp -d) && git init && codex exec 'Build a snake game in Python'")
 ```
 
 ## Background Mode (Long Tasks)
 
 ```
-# Start in background with PTY
-terminal(command="codex exec --sandbox workspace-write 'Refactor the auth module'", workdir="~/project", background=true, pty=true)
+# Start in background
+terminal(command="codex exec --sandbox workspace-write 'Refactor the auth module'", workdir="~/project", background=true)
 # Returns session_id
 
 # Monitor progress
 process(action="poll", session_id="<id>")
 process(action="log", session_id="<id>")
-
-# Send input if Codex asks a question
-process(action="submit", session_id="<id>", data="yes")
 
 # Kill if needed
 process(action="kill", session_id="<id>")
@@ -98,6 +95,8 @@ when the same command works in the user's interactive shell. A typical symptom i
 bubblewrap/user-namespace errors such as `setting up uid map: Permission denied`
 or `loopback: Failed RTM_NEWADDR: Operation not permitted`.
 
+Concrete check, from the same service context: `sysctl kernel.apparmor_restrict_unprivileged_userns` and `unshare --user --map-root-user true`. A value of `1` or an `unshare` failure such as `write failed /proc/self/uid_map: Operation not permitted` means the host blocks unprivileged user namespaces for that process, so bubblewrap cannot start.
+
 Treat sandbox failure as a blocker. Do not respond by enabling `danger-full-access` or bypassing permissions. Diagnose the supported invocation or report the blocked boundary. A path allowlist, workdir, narrow prompt and later diff review are not a sandbox.
 
 ## PR Reviews
@@ -105,7 +104,7 @@ Treat sandbox failure as a blocker. Do not respond by enabling `danger-full-acce
 Clone to a temp directory for safe review:
 
 ```
-terminal(command="REVIEW=$(mktemp -d) && git clone https://github.com/user/repo.git $REVIEW && cd $REVIEW && gh pr checkout 42 && codex review --base origin/main", pty=true)
+terminal(command="REVIEW=$(mktemp -d) && git clone https://github.com/user/repo.git $REVIEW && cd $REVIEW && gh pr checkout 42 && codex review --base origin/main")
 ```
 
 ## Parallel Issue Fixing with Worktrees
@@ -116,8 +115,8 @@ terminal(command="git worktree add -b fix/issue-78 ~/.hermes/cache/scratch/issue
 terminal(command="git worktree add -b fix/issue-99 ~/.hermes/cache/scratch/issue-99 main", workdir="~/project")
 
 # Launch Codex in each
-terminal(command="codex --sandbox workspace-write exec 'Fix issue #78: <description>. Commit when done.'", workdir="~/.hermes/cache/scratch/issue-78", background=true, pty=true)
-terminal(command="codex --sandbox workspace-write exec 'Fix issue #99: <description>. Commit when done.'", workdir="~/.hermes/cache/scratch/issue-99", background=true, pty=true)
+terminal(command="codex --sandbox workspace-write exec 'Fix issue #78: <description>. Commit when done.'", workdir="~/.hermes/cache/scratch/issue-78", background=true)
+terminal(command="codex --sandbox workspace-write exec 'Fix issue #99: <description>. Commit when done.'", workdir="~/.hermes/cache/scratch/issue-99", background=true)
 
 # Monitor
 process(action="list")
@@ -137,8 +136,8 @@ terminal(command="git worktree remove ~/.hermes/cache/scratch/issue-78", workdir
 terminal(command="git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'", workdir="~/project")
 
 # Review multiple PRs in parallel
-terminal(command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'", workdir="~/project", background=true, pty=true)
-terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'", workdir="~/project", background=true, pty=true)
+terminal(command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'", workdir="~/project", background=true)
+terminal(command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'", workdir="~/project", background=true)
 
 # Post results
 terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
@@ -147,7 +146,7 @@ terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 ## Rules
 
 1. **Noninteractive exec needs no PTY** — use `pty=true` only for the interactive CLI.
-2. **Git repo required** — Codex won't run outside a git directory. Use `mktemp -d && git init` for scratch
+2. **Run inside a git repo** — outside one, `codex exec` needs `--skip-git-repo-check`. Use `mktemp -d && git init` for scratch
 3. **Use `exec` for one-shots** — `codex exec "prompt"` runs and exits cleanly
 4. **`--sandbox workspace-write` for building** — auto-approves changes within the sandbox (`--full-auto` is deprecated for this)
 5. **Background for long tasks** — use `background=true` and monitor with `process` tool

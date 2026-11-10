@@ -1,11 +1,11 @@
 # Running FLUX on Low/Mid RAM Systems (≤32GB)
 
 The raw `FLUX.1-schnell` and `FLUX.1-dev` models are massive.
-- **UNET:** ~17 GB (`fp8` version) to 23 GB (`fp16`)
-- **Text Encoders:** ~6.5 GB (t5xxl + clip_l)
-- **VAE:** ~300 MB
+- **UNET:** ~17 GB (`fp8` version) to ~24 GB (`fp16`)
+- **Text Encoders:** ~5 GB (`t5xxl_fp8_e4m3fn` + `clip_l`) to ~10 GB (`t5xxl_fp16` + `clip_l`)
+- **VAE:** ~335 MB
 
-When ComfyUI loads these raw `.safetensors` files, it maps them directly into system RAM before moving them to VRAM. On a machine with **32GB of RAM or less**, loading a 23GB model alongside the OS overhead (Chrome, Discord, Obsidian, OS services) will exhaust the memory pool.
+When ComfyUI loads these raw `.safetensors` files, it maps them directly into system RAM before moving them to VRAM. On a machine with **32GB of RAM or less**, loading a 24GB model alongside the OS overhead (Chrome, Discord, Obsidian, OS services) will exhaust the memory pool.
 
 This causes:
 1. **100% CPU Usage** (The Linux kernel thrashes as it desperately pages RAM to the SSD swap file).
@@ -14,7 +14,7 @@ This causes:
 
 ## The Fix: GGUF Quantization
 
-Do NOT attempt to run standard FLUX safetensors on these machines. Instead, use **GGUF** (GPT-Generated Unified Format) quantized models. Quantization mathematically compresses the 17GB UNET down to ~6GB (`Q4_K_S`) or ~8GB (`Q8_0`) with almost zero perceptible loss in visual quality.
+Do NOT attempt to run standard FLUX safetensors on these machines. Instead, use **GGUF** (GPT-Generated Unified Format) quantized models. Quantization mathematically compresses the 17GB UNET down to ~6.8GB (`Q4_K_S`) or ~12.7GB (`Q8_0`) with almost zero perceptible loss in visual quality.
 
 ### 1. Install ComfyUI-GGUF Custom Node
 The base ComfyUI installation does not support GGUF UNETs. You must install the custom node:

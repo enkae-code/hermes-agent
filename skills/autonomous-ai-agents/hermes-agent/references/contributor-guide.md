@@ -97,7 +97,7 @@ scripts/run_tests.sh -v --tb=long             # pass-through pytest flags
 
 - Tests auto-redirect `HERMES_HOME` to temp dirs — never touch real `~/.hermes/`.
 - For direct test runs from an activated Hermes development environment, preserve the project's dependency paths and unset any inherited `HERMES_HOME` only when the repo's test fixture establishes its own isolated home; inspect setup/teardown errors rather than treating them as product failures. When a helper imports Hermes source modules, run it through the repository's supported environment/bootstrap rather than a bare isolated Python (`-I` ignores `PYTHONPATH` and can hide the dependencies Hermes normally initializes); confirm the helper resolves imports from the intended checkout, especially when using a worktree. Capture pytest's actual exit code directly—avoid `| tail` unless `pipefail` is enabled.
-- An uncommitted candidate is lost if the worktree is removed after a failed commit; uncommitted `git add` blobs can be recovered with `find .git/objects -mmin -N` + `git cat-file`.
+- Removing a worktree after a failed commit loses its unstaged edits. Staged (`git add`) blobs stay in the shared object store: from the main checkout, `git fsck --lost-found` writes dangling blobs to `.git/lost-found/other/`.
 - Prepare Python through the PM developer workflow before building a test environment.
 - Run `python -m pm.build_env --source . --out .venv --group dev --group test`.
   The output must not exist. Stop its processes and intentionally remove only

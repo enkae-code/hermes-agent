@@ -72,7 +72,7 @@ fixes, reviews, second opinions) to Antigravity rather than just smoke-testing.
 ### One-shot (preferred for scripted prompts and second opinions)
 
 ```
-terminal(command="agy -p 'Review this diff for bugs and security issues' --model gemini-3.8-flash-high --sandbox --print-timeout 4m", workdir="/path/to/repo", timeout=300)
+terminal(command="agy -p 'Review this diff for bugs and security issues' --model <listed-model-id> --sandbox --print-timeout 4m", workdir="/path/to/repo", timeout=300)
 ```
 
 `-p` is non-interactive: it runs the prompt and exits. Pick the engine with

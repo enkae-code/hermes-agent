@@ -111,8 +111,8 @@ When correcting live content data, update only the intended record and fields, r
 4. Create a route-by-locale coverage ledger from the inventory. For each entry, mark inspected or blocked, record the exact source location and live URL where verified, and categorize it as aligned, conflicting, partially aligned or unverified. Do not count a route as inspected from inventory/search results alone; read its template and immediately rendered copy. Keep shared navigation, footer, metadata and structured data as explicit shared surfaces in the ledger.
 5. Compare every inventoried route/template and locale against the authority. For a delegated audit, assign non-overlapping route partitions, reconcile every worker result into the same ledger, and re-dispatch or inspect gaps until each entry has an evidence-backed outcome. A worker's partial summary or an early status update does not close the audit. If the user asks to inspect remaining items, resume the missing ledger entries and continue in bounded batches rather than returning another plan or partial summary. Report complete only when inspected + explicitly blocked entries reconcile to the inventory count; list blockers and inaccessible states separately.
 6. Inspect production and repository source as separate evidence. A live page proves what was served at inspection time, not that the current checkout is deployed; do not assert source/live correspondence without an independent deployment/build identity check.
-6. Do not submit claims, forms, logins or waitlists merely to explore. Inspect safe pre-submit states, label untested authenticated and data-dependent states, and stop at consequential actions.
-7. If the audit is delegated or time-bounded, treat worker summaries as leads, verify their baseline and representative evidence, and do not upgrade a partial report to comprehensive without matching route and locale counts.
+7. Do not submit claims, forms, logins or waitlists merely to explore. Inspect safe pre-submit states, label untested authenticated and data-dependent states, and stop at consequential actions.
+8. If the audit is delegated or time-bounded, treat worker summaries as leads, verify their baseline and representative evidence, and do not upgrade a partial report to comprehensive without matching route and locale counts.
 
 ### Phase 3: Collect Evidence
 
@@ -128,7 +128,7 @@ For every issue found:
    - Console errors (if any)
    - Screenshot path
 
-3. **Classify the issue** using the issue taxonomy (see `references/issue-taxonomy.md`):
+3. **Classify the issue** using the issue taxonomy (see `references/issue-taxonomy.md`; recurring website patterns are in `references/common-website-issues.md`):
    - Severity: Critical / High / Medium / Low
    - Category: Functional / Visual / Accessibility / Console / UX / Content
 

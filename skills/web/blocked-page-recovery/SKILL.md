@@ -17,8 +17,8 @@ For public content that won't fetch — 403/429, a paywall, or a non-interactive
 bot interstitial — don't loop on the same URL; a third-party service may hold
 a copy. This workflow is for retrieving public content, not gaining account
 access or bypassing a security challenge. For login walls, CAPTCHA/Turnstile,
-interactive bot verification, or account-security checkpoints, stop and follow
-the browser-harness human-handoff procedure; do not use archives, APIs, or a
+interactive bot verification, or account-security checkpoints, stop and ask the
+user to take over the browser and complete it; do not use archives, APIs, or a
 different network as a workaround. If asked whether a VPN contributed, treat
 it as a hypothesis only: an IP/ASN lookup cannot establish the cause. The
 operator may test the same browser/page with their VPN disabled themselves.

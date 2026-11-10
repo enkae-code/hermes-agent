@@ -10,11 +10,11 @@
 2. Some tools need env vars (check `.env`)
 3. `/reset` after enabling tools
 
-### Desktop `stream_drop` error cards (nous upstream)
+### Desktop `stream_drop` error cards (provider-side)
 
 Symptom: desktop pops `layer: streaming, code: stream_drop` error cards that auto-report as a new session. Provider logs show the real cause — check `~/.hermes/logs/agent.log` for `Stream drop ... retrying` (agent.stream_diag): typically `RemoteProtocolError: peer closed connection without sending complete message body`, HTTP 200 via Cloudflare, few bytes, long TTFB (20-55s) on large task prompts.
 
-Diagnosis: that signature is the upstream (nous inference API) killing the stream mid-response — provider-side, not local config. Confirm with a tiny streaming probe (small max_tokens) — if tiny prompts succeed, local network/auth are fine.
+Diagnosis: that signature is an upstream provider dropping the stream mid-response — provider-side, not local config. Confirm with a tiny streaming probe (small max_tokens) — if tiny prompts succeed, local network/auth are fine.
 
 Mitigation: `HERMES_STREAM_RETRIES` (default 2) in `~/.hermes/.env` — bump to 4 so transient drops retry before surfacing a card. Stale-stream detector: `HERMES_STREAM_STALE_TIMEOUT` (default 180s). Restart the Desktop app (or `/reload`) after editing .env. Only a model/provider switch removes the root cause; that's an operator call.
 

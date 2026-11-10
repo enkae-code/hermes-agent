@@ -227,11 +227,11 @@ search_files("similar_pattern", path="src/", file_glob="*.py")
 - What settings, config, environment?
 - What assumptions does it make?
 
-### Lock Contention and Head-of-Line Blocking
+### 5. Lock Contention and Head-of-Line Blocking
 
 When unrelated operations stall together, map the lock acquisition/wait graph before blaming the visibly slow operation. Inspect every acquisition, awaited call, and release; a shared/global lock held while waiting on a per-session lock lets one busy session block all sessions. Confirm with a two-operation regression test: deliberately hold one session's lock, then prove another session can still make progress. Keep unrelated work outside the shared critical section, and preserve lock invariants with focused tests rather than merely shortening a timeout. Do not name the lock holder or root cause from timing correlation alone; verify the call path and lock scope in source or runtime evidence.
 
-### 5. Change the Boundary When Sanitization Keeps Failing
+### 6. Change the Boundary When Sanitization Keeps Failing
 
 When repeated escaping, encoding, or delimiter variants expose new secret-redaction bypasses, stop adding pattern exceptions. Trace whether the sensitive free text is needed at all; prefer emitting structured, allowlisted metadata instead. If arbitrary text must remain, define the accepted schema and fail closed, then test both secret leakage across representations and preservation of required safe output. Never present a heuristic allowlist as proof if a secret can still appear as an ordinary-looking word.
 

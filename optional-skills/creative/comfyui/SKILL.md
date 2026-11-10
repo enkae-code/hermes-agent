@@ -45,6 +45,8 @@ for workflow execution.
   free-tier job, 1080p VRAM ceiling), Discord-compatible ffmpeg stitch.
   Authored by [@purzbeats](https://github.com/purzbeats). Load this whenever
   you're starting from an official template.
+- `flux-gguf-low-ram.md` — running FLUX on ≤32GB RAM with GGUF UNETs
+  (`templates/flux_schnell_gguf.json`).
 
 **Scripts (`scripts/`):**
 

@@ -91,4 +91,4 @@ For wiring an OpenAI-compatible remote TTS service, including a localhost SSH tu
 | Gemini | `GOOGLE_API_KEY` | Free tier |
 | NeuTTS / Piper / KittenTTS (local) | None | Free |
 
-Voice commands: `/voice on` (voice-to-voice), `/voice tts` (always voice), `/voice off`. These are CLI/gateway slash commands — the desktop chat input does NOT route them (they arrive as plain text).
+Voice commands (CLI and gateway): `/voice on` (voice-to-voice), `/voice tts` (always voice), `/voice off`, `/voice status`; bare `/voice` toggles in the CLI. Desktop doesn't run `/voice`; it replies by pointing you to the composer microphone button ("Start voice chat").
