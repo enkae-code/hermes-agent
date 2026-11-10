@@ -82,7 +82,8 @@ You MUST complete each phase before proceeding to the next.
 - Does the command fail for this bug and only pass once the bug is fixed?
 - Is it fast enough to run repeatedly?
 - Is it deterministic? For flaky bugs, can you raise the reproduction rate high enough to debug?
-- If not reproducible → gather more data, don't guess.
+- If not reproducible → gather more data, don't guess. A nearby probe that exercises the same dependency is not proof that the user's failing path is fixed; rerun the exact endpoint or operation and inspect both its response and the server-side error after each change.
+- Attribute a denial or failure only to the boundary named by its evidence; do not blame operator action unless the tool output shows that action caused it.
 
 **Ways to construct a loop — try in roughly this order:**
 
@@ -118,11 +119,14 @@ python scripts/repro_bug.py
 for i in {1..100}; do pytest tests/test_flake.py::test_name -q || break; done
 ```
 
-### 3. Check Recent Changes
+### 3. Check Recent Changes and Test Environment
 
 - What changed that could cause this?
 - Git diff, recent commits
 - New dependencies, config changes
+- Compare the failing process's environment and loaded env files with a clean or known-good run; a clean clone can differ in both source and environment, so pin the same commit before drawing conclusions.
+- When a test failure looks environment-dependent, read the exact error first, then inspect only the relevant variable's presence/shape without printing secrets. Trace which loader supplies it and its precedence; shell overrides do not help if a later loader explicitly overrides them.
+- Capture test output without masking its exit status: prefer direct execution, or use `set -o pipefail` with `tee`; downstream pipeline filters can make a failed test command appear successful.
 
 **Action:**
 
@@ -139,19 +143,16 @@ git log -p --follow src/problematic_file.py | head -100
 
 ### 4. Gather Evidence in Multi-Component Systems
 
-**WHEN system has multiple components (API → service → database, CI → build → deploy):**
+**WHEN a system crosses components or transports (UI → client → socket/HTTP → service → state):**
 
-**BEFORE proposing fixes, add diagnostic instrumentation:**
+1. Read the implementation to identify the actual transport, framing and call path before choosing an instrumentation hook; do not infer the transport from the UI or a nearby component.
+2. Hook that transport at the layer the application actually uses. Validate the hook first by observing a known handshake or request/reply; an empty trace is evidence only after hook coverage is established.
+3. For framed protocols, identify message classes before changing size limits: responses, events and server-initiated requests may have different payload needs. Keep a finite absolute ceiling for every class, preserve stricter limits for small control messages, and test that oversized input is rejected without silently leaving the matching request to time out.
+4. Record only the metadata needed to locate the failing boundary (method, status/error kind, bounded identifier and elapsed time). Redact credentials, payloads and user content.
+5. Preserve potentially large or encoded command output in a file, then inspect the relevant bounded slice; truncated tool output cannot establish that an event was absent.
+6. Reproduce once and correlate request/reply timing with component and service logs. State which boundaries were measured and which remain unverified.
 
-For EACH component boundary:
-- Log what data enters the component
-- Log what data exits the component
-- Verify environment/config propagation
-- Check state at each layer
-
-Run once to gather evidence showing WHERE it breaks.
-THEN analyze evidence to identify the failing component.
-THEN investigate that specific component.
+Run once to gather evidence showing WHERE it breaks, then investigate that component. If the exact failing event is still unavailable, keep the cause explicitly unconfirmed and improve the probe rather than proposing a speculative fix or repeatedly rerunning the same ineffective hook. After two probes fail to capture the boundary, stop repeating variants in the same lane: inspect whether the hook was validated against a known request, trace the actual transport from source, then change the instrumentation layer or route a fresh independent diagnosis.
 
 ### 5. Trace Data Flow
 
@@ -225,6 +226,14 @@ search_files("similar_pattern", path="src/", file_glob="*.py")
 - What other components does this need?
 - What settings, config, environment?
 - What assumptions does it make?
+
+### Lock Contention and Head-of-Line Blocking
+
+When unrelated operations stall together, map the lock acquisition/wait graph before blaming the visibly slow operation. Inspect every acquisition, awaited call, and release; a shared/global lock held while waiting on a per-session lock lets one busy session block all sessions. Confirm with a two-operation regression test: deliberately hold one session's lock, then prove another session can still make progress. Keep unrelated work outside the shared critical section, and preserve lock invariants with focused tests rather than merely shortening a timeout. Do not name the lock holder or root cause from timing correlation alone; verify the call path and lock scope in source or runtime evidence.
+
+### 5. Change the Boundary When Sanitization Keeps Failing
+
+When repeated escaping, encoding, or delimiter variants expose new secret-redaction bypasses, stop adding pattern exceptions. Trace whether the sensitive free text is needed at all; prefer emitting structured, allowlisted metadata instead. If arbitrary text must remain, define the accepted schema and fail closed, then test both secret leakage across representations and preservation of required safe output. Never present a heuristic allowlist as proof if a secret can still appear as an ordinary-looking word.
 
 ---
 

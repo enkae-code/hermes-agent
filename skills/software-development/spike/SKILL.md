@@ -110,6 +110,10 @@ spikes/
 
 **Depth over speed.** Never declare "it works" after one happy-path run. Test edge cases. Follow surprising findings. The verdict is only trustworthy when the investigation was honest.
 
+**Validate against ground truth before tuning.** For detection or classification tools, use a real known-positive example, representative clean changes, and a near-miss or corrective change. Report detection and false-alarm behavior separately; a single caught violation does not establish that a tool is reliable. Run git-based checks from the target repository and verify the tested revision exists there, because `git diff` interprets paths and revisions relative to the current checkout.
+
+**Choose the verdict from measured usefulness.** Distinguish a human-reviewed diagnostic from an automated gate. If ordinary changes or fixes produce noise, state that limitation plainly and stop tuning when another change would only fit the small sample; recommend what additional ground truth is needed before claiming gate readiness. Explain the tool's behavior and limits in plain language when handing it to the user.
+
 **Avoid** unless the spike specifically requires it: complex package management, build tools/bundlers, Docker, env files, config systems. Hardcode everything — it's a spike.
 
 **Building one spike** — a typical tool sequence:

@@ -95,6 +95,25 @@ Batch each step's actions into one `browser_exec` call. For each page or feature
    - Visual changes: `capture_screenshot()` and compare with the previous one
    - Expected vs actual behavior (`page_info()`, or `js()` reading the relevant element)
 
+### Content and media accuracy
+
+When auditing published claims, credits, or images, verify what the asset actually depicts rather than treating its caption, alt text, filename, credit, or headline as proof. Stock/illustrative portraits do not establish the identity of a named person; require direct visual confirmation against reliable subject evidence, otherwise suppress the image rather than approve it. A plausible visual resemblance is not a match.
+
+For batch audits, sweep the full approved set for the same failure pattern after finding one false positive; inspect all candidate rows rather than stopping at the reported example. If the needed visual evidence or inspection capability is unavailable, fail closed and report the unresolved items separately from verified matches.
+
+When correcting live content data, update only the intended record and fields, read the exact record back to verify the persisted state, then verify the rendered public page after its cache/revalidation window. Database success alone does not prove the published view changed.
+
+### Whole-site identity and terminology audits
+
+1. Read the current product-direction authority and identify accepted promises, explicit boundaries, superseded positioning and features that are only planned. Treat the specification as the comparison baseline, not evidence that a feature exists.
+2. Inventory routes from the source tree before browsing. Map route files to public URLs, including dynamic templates, locale variants, shared navigation/footer, metadata and page-specific messages. Count the inventory; a sample of popular pages is not a full-site audit.
+3. Search source for the old positioning terms and their localized equivalents, then read surrounding context. Separate useful capabilities (for example, a verification tool) from copy that incorrectly makes that capability the overall product identity. Search metadata, structured data, SEO/LLM descriptions and legal copy as well as visible page text.
+4. Create a route-by-locale coverage ledger from the inventory. For each entry, mark inspected or blocked, record the exact source location and live URL where verified, and categorize it as aligned, conflicting, partially aligned or unverified. Do not count a route as inspected from inventory/search results alone; read its template and immediately rendered copy. Keep shared navigation, footer, metadata and structured data as explicit shared surfaces in the ledger.
+5. Compare every inventoried route/template and locale against the authority. For a delegated audit, assign non-overlapping route partitions, reconcile every worker result into the same ledger, and re-dispatch or inspect gaps until each entry has an evidence-backed outcome. A worker's partial summary or an early status update does not close the audit. If the user asks to inspect remaining items, resume the missing ledger entries and continue in bounded batches rather than returning another plan or partial summary. Report complete only when inspected + explicitly blocked entries reconcile to the inventory count; list blockers and inaccessible states separately.
+6. Inspect production and repository source as separate evidence. A live page proves what was served at inspection time, not that the current checkout is deployed; do not assert source/live correspondence without an independent deployment/build identity check.
+6. Do not submit claims, forms, logins or waitlists merely to explore. Inspect safe pre-submit states, label untested authenticated and data-dependent states, and stop at consequential actions.
+7. If the audit is delegated or time-bounded, treat worker summaries as leads, verify their baseline and representative evidence, and do not upgrade a partial report to comprehensive without matching route and locale counts.
+
 ### Phase 3: Collect Evidence
 
 For every issue found:

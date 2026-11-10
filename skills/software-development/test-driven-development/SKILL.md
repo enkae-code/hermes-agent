@@ -96,6 +96,8 @@ Vague name, tests mock not real code.
 
 **MANDATORY. Never skip.**
 
+Preserve the test's readable stdout/stderr and exact exit status in a per-attempt artifact. If the runner returns only a generic completion claim or opaque/truncated output, do not mark RED proven; rerun the focused test independently with output redirected to a readable file and capture `$?` immediately. For mutation/baseline checks, restore the exact source after the run and verify the candidate is back before proceeding.
+
 ```bash
 # Use terminal tool to run the specific test
 pytest tests/test_feature.py::test_specific_behavior -v
@@ -301,6 +303,14 @@ Can't check all boxes? You skipped TDD. Start over.
 
 ## Hermes Agent Integration
 
+### Refactors That Move an Integration Boundary
+
+Before changing production code, trace the changed contract through all focused tests, sibling suites, hand-built database/client mocks, fixtures, and callers. Update mocks to represent the new boundary rather than preserving obsolete transaction or commit behavior; stale doubles can make a correct refactor look broken or hide untested paths.
+
+Keep the behavior under test real where practical, while stubbing paid or external calls so a test cannot accidentally invoke them. When a focused integration test fails with a generic HTTP error, inspect the response body and captured exception/stack first; fix the mock if it does not implement the new contract, and only then investigate production behavior.
+
+After each boundary change, run the focused test file, then sibling suites that share the contract, then broader tests. Add assertions for the new invariant and recovery/failure paths, not only the happy path.
+
 ### Running Tests
 
 Use the `terminal` tool to run tests at each step:
@@ -349,7 +359,7 @@ Never fix bugs without a test.
 
 - **Testing mock behavior instead of real behavior** — mocks should verify interactions, not replace the system under test
 - **Testing implementation details** — test behavior/results, not internal method calls
-- **Happy path only** — always test edge cases, errors, and boundaries
+- **Happy path only** — test meaningful fallback/error/boundary states as well as success; for shared user-facing copy, exercise the real renderer across conditional states and assert a fallback does not retain claims true only on the success path
 - **Brittle tests** — tests should verify behavior, not structure; refactoring shouldn't break them
 
 ## Final Rule

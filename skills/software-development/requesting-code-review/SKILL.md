@@ -70,9 +70,15 @@ git diff --cached | grep "^+" | grep -E "execute\(f\"|\.format\(.*SELECT|\.forma
 
 ## Step 3 — Baseline tests and linting
 
-Detect the project language and run the appropriate tools. Capture the failure
-count BEFORE your changes as **baseline_failures** (stash changes, run, pop).
-Only NEW failures introduced by your changes block the commit.
+Read the project workflow and use its required formatter, static/language gates,
+and real tests. Prefer a baseline SHA already established by the project. If it
+is missing, run the same gates on an isolated checkout of the exact baseline;
+do not stash or rewrite the candidate worktree just to measure baseline failures.
+Record each command, exit status, and relevant summary. Only regressions against
+the verified baseline are attributable to the candidate, but required gates must
+still be reported even when they fail for an environmental reason. For resource-
+intensive gates, use bounded foreground runs with separate logs; background jobs
+may be interrupted or have output detached from the checkout being verified.
 
 **Test frameworks** (auto-detect by project files):
 ```bash
