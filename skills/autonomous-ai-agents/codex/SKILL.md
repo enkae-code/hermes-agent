@@ -29,8 +29,8 @@ Requires the codex CLI and a git repository.
 - Codex installed: `npm install -g @openai/codex`
 - OpenAI auth configured: either `OPENAI_API_KEY` or Codex OAuth credentials
   from the Codex CLI login flow
-- **Must run inside a git repository** — Codex refuses to run outside one
-- Use `pty=true` in terminal calls — Codex is an interactive terminal app
+- Prefer a git repository; only use `--skip-git-repo-check` for an authorized non-repository task.
+- `codex exec` is noninteractive and does not require a PTY. Reserve `pty=true` for the interactive CLI.
 
 For Hermes itself, `model.provider: openai-codex` uses Hermes-managed Codex
 OAuth from `~/.hermes/auth.json` after `hermes auth add openai-codex`. For the
@@ -40,9 +40,21 @@ that Codex auth is missing.
 
 ## One-Shot Tasks
 
+Keep agent-authored writes inside the native writable roots. For a receipt outside the checkout, use the outer CLI's `--output-last-message` capture and ask the worker for a final response, not a file write. Do not broaden sandbox permissions merely to fix reporting.
+
 ```
 terminal(command="codex exec 'Add dark mode toggle to settings'", workdir="~/project", pty=true)
 ```
+
+For a bounded read-only source investigation, feed a reviewed work order on stdin, pin the model and effort, write the final answer to a dedicated artifact, and keep the native sandbox read-only:
+
+```bash
+codex exec --model <approved-model> --config 'model_reasoning_effort="high"' \
+  --sandbox read-only --output-last-message /absolute/path/result.md - \
+  < /absolute/path/work-order.md > /absolute/path/run.log 2>&1
+```
+
+Bound the run with the process timeout. If it runs in the background, capture its process/session ID and verify the startup log reports the requested model, effort, and read-only sandbox before relying on it. Startup metadata proves routing only: wait for normal completion, inspect the terminal status and actual result artifact, then independently verify any source claims against the frozen candidate. A dispatched or still-running investigation has no findings or verdict yet.
 
 For scratch work (Codex needs a git repo):
 ```
@@ -73,8 +85,8 @@ process(action="kill", session_id="<id>")
 |------|--------|
 | `exec "prompt"` | One-shot execution, exits when done |
 | `--sandbox workspace-write` (`-s`) | Sandboxed but auto-approves file changes in the workspace (the recommended auto-build mode) |
-| `--dangerously-bypass-approvals-and-sandbox` | No sandbox, no approvals (fastest, most dangerous; `--yolo` still works as a hidden alias) |
-| `--sandbox danger-full-access` | No Codex sandbox; useful when the host service context breaks bubblewrap |
+| `--dangerously-bypass-approvals-and-sandbox` | Disables safety boundaries; never select as a default or sandbox-failure workaround. Requires separate explicit operator authorization. |
+| `--sandbox danger-full-access` | No Codex sandbox; not a recovery for service/user-namespace failures. Stop and diagnose the supported boundary. |
 
 > **Deprecated:** `--full-auto` still works but the live CLI warns to use `--sandbox workspace-write` instead.
 
@@ -86,15 +98,7 @@ when the same command works in the user's interactive shell. A typical symptom i
 bubblewrap/user-namespace errors such as `setting up uid map: Permission denied`
 or `loopback: Failed RTM_NEWADDR: Operation not permitted`.
 
-In that context, prefer:
-
-```
-codex exec --sandbox danger-full-access "<task>"
-```
-
-Use process boundaries as the safety layer instead: explicit `workdir`, clean git
-status before launch, narrow task prompts, `git diff` review, targeted tests, and
-human/agent confirmation before committing broad changes.
+Treat sandbox failure as a blocker. Do not respond by enabling `danger-full-access` or bypassing permissions. Diagnose the supported invocation or report the blocked boundary. A path allowlist, workdir, narrow prompt and later diff review are not a sandbox.
 
 ## PR Reviews
 
@@ -142,7 +146,7 @@ terminal(command="gh pr comment 86 --body '<review>'", workdir="~/project")
 
 ## Rules
 
-1. **Always use `pty=true`** — Codex is an interactive terminal app and hangs without a PTY
+1. **Noninteractive exec needs no PTY** — use `pty=true` only for the interactive CLI.
 2. **Git repo required** — Codex won't run outside a git directory. Use `mktemp -d && git init` for scratch
 3. **Use `exec` for one-shots** — `codex exec "prompt"` runs and exits cleanly
 4. **`--sandbox workspace-write` for building** — auto-approves changes within the sandbox (`--full-auto` is deprecated for this)

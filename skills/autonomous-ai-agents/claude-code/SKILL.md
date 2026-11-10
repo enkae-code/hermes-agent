@@ -381,6 +381,7 @@ Use the `#` prefix in interactive mode to quickly add to memory: `# Always use 2
 | `/resume` | Switch to or resume a different session |
 | `/rewind` | Revert to a previous checkpoint in conversation or code |
 | `/btw <question>` | Ask a side question without adding to context cost |
+| `/recap` | One-line summary of where the session is up to |
 | `/status` | Show version, connectivity, and session info |
 | `/todos` | List tracked action items from the conversation |
 | `/exit` or `Ctrl+D` | End session |
@@ -398,6 +399,8 @@ Use the `#` prefix in interactive mode to quickly add to memory: `# Always use 2
 | Command | Purpose |
 |---------|---------|
 | `/model [model]` | Switch models mid-session (use arrow keys to adjust effort) |
+| `/advisor [model\|off]` | Consult a stronger second model (`opus`, `sonnet`, `fable`) only at key decisions; lets a cheaper main model run the session |
+| `/skill-doctor` | Per-skill context cost and usage frequency, to find skills to turn off (v2.1.252+, needs feature-flag fetching) |
 | `/effort [level]` | Set reasoning effort: `low`, `medium`, `high`, `xhigh`, or `max` |
 | `/init` | Create a CLAUDE.md file for project memory |
 | `/memory` | Open CLAUDE.md for editing |
