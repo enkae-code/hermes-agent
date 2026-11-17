@@ -75,7 +75,8 @@ async def test_admin_reply_routes_to_origin_session(tmp_path, index):
 
     await runner._route_reply_to_origin_session(event, event.source, KEY)
 
-    runner.session_store.switch_session.assert_called_once_with(KEY, "origin", preserve_prompt_pin=False)
+    runner.session_store.switch_session.assert_called_once_with(KEY, "origin", preserve_prompt_pin=False,
+                                           expected_session_id="current")
 
 
 @pytest.mark.asyncio
@@ -199,6 +200,37 @@ async def test_work_admitted_on_the_target_during_the_preflight_holds_the_route(
 
     assert "still running" in notice
     assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_a_new_during_the_reply_flight_is_not_overwritten(tmp_path, index, monkeypatch):
+    """The store's compare-and-swap fences the move against a concurrent /new//resume: the switch is
+    refused, the message continues on the lane's current route, and the handle stays live."""
+    runner, db = _runner(tmp_path)
+    runner._is_session_running = lambda key: False
+    runner.session_store.switch_session = MagicMock(return_value=None)  # CAS: snapshot stale
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    event = _reply("m1", _source(user_id="99"))
+    notice = await runner._route_reply_to_origin_session(event, event.source, KEY)
+
+    assert notice is None  # the message continues on the lane's current route
+    assert index.lookup_marker(f"telegram:{CHAT}", "m1", "session") == "origin"
+
+
+@pytest.mark.asyncio
+async def test_the_reply_switch_compares_against_its_own_snapshot(tmp_path, index, monkeypatch):
+    runner, db = _runner(tmp_path)
+    runner._is_session_running = lambda key: False
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    event = _reply("m1", _source(user_id="99"))
+    await runner._route_reply_to_origin_session(event, event.source, KEY)
+
+    call = runner.session_store.switch_session.call_args
+    assert call.kwargs["expected_session_id"] == "current"  # the pre-await snapshot
 
 
 @pytest.mark.asyncio
@@ -393,7 +425,8 @@ async def test_resume_still_switches_on_its_own_path(tmp_path, index):
     reply = await runner._handle_resume_command(MessageEvent(text="/resume named", source=_source()))
 
     assert "Research" in reply
-    runner.session_store.switch_session.assert_called_once_with(KEY, "named", preserve_prompt_pin=False)
+    runner.session_store.switch_session.assert_called_once_with(KEY, "named", preserve_prompt_pin=False,
+                                           expected_session_id=None)
 
 
 def test_send_records_origin_only_with_session_env(index, monkeypatch):

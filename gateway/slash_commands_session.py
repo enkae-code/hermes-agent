@@ -1178,9 +1178,13 @@ class GatewaySessionCommandsMixin:
         return t("gateway.resume.blocked_not_owner", name=name)
 
     async def _repoint_route(self, source, session_key, current_entry, target_id, local_owner, authority,
-                             fallback_title=None, busy_guard=None, settled_guard=None):
+                             fallback_title=None, busy_guard=None, settled_guard=None,
+                             expected_session_id=None):
         """Point *session_key* at *target_id* the /resume way; shared with reply routing.
-        Returns ``(refusal text or None, departed-queue count, title or None)``. *settled_guard*
+        Returns ``(refusal text or None, departed-queue count, title or None, moved)``. Reply
+        routing passes *expected_session_id*: the store's compare-and-swap refuses when a concurrent
+        ``/new``/``/resume`` moved the lane after the reply's snapshot, and the caller then lets the
+        message continue on the lane's current route without spending the handle. *settled_guard*
         (reply routing only) re-runs the target's ``require_settled`` fence on a write transaction
         as the last await before the move — the /handoff watcher's own pattern, where an admission
         later than the fence wins by queueing. *busy_guard* then runs synchronously, with no await
@@ -1188,23 +1192,26 @@ class GatewaySessionCommandsMixin:
         from gateway.session_route_recovery import follow_hand_off
         conflict = await self._telegram_topic_switch_conflict(source, target_id)
         if conflict is not None:
-            return conflict, 0, None
+            return conflict, 0, None, False
         if settled_guard is not None and (settled_notice := await settled_guard()) is not None:
-            return settled_notice, 0, None
+            return settled_notice, 0, None, False
         if busy_guard is not None and (guard_notice := busy_guard()) is not None:
-            return guard_notice, 0, None
+            return guard_notice, 0, None, False
         self._release_running_agent_state(session_key)
         with self._telegram_topic_publication(source):
             new_entry = await self.async_session_store.switch_session(
                 session_key, target_id, preserve_prompt_pin=False,
+                expected_session_id=expected_session_id,
             )
             if not new_entry:
-                return t("gateway.resume.switch_failed"), 0, None
+                if expected_session_id is not None:  # CAS refused: the route moved meanwhile
+                    return None, 0, None, False
+                return t("gateway.resume.switch_failed"), 0, None, False
             try:
                 await self._follow_telegram_topic_switch(source, new_entry, reason="resume-command",
                                                          departed=current_entry)
             except TopicLinkedElsewhere as refused:  # bound elsewhere since the check: route put back
-                return str(refused), 0, None
+                return str(refused), 0, None, False
         # /resume also leaves the paused chat's queued messages on the departed conversation.
         # Count only after the route switched, as /new does, so fresh admissions use the new route.
         left_count = await paused_followers(self, current_entry.session_id)
@@ -1227,7 +1234,7 @@ class GatewaySessionCommandsMixin:
         except Exception as e:  # metadata only: the switch above already succeeded
             logger.debug("Post-switch title/topic rename failed (route already moved): %s", e, exc_info=True)
             title = fallback_title
-        return None, left_count, title
+        return None, left_count, title, True
 
     async def _route_reply_to_origin_session(self, event: MessageEvent, source, session_key: str,
                                              is_internal: bool = False) -> Optional[str]:
@@ -1274,14 +1281,15 @@ class GatewaySessionCommandsMixin:
                     return t("gateway.busy.another_turn_running")
                 return None
 
-            refused, _left, _title = await self._repoint_route(
+            refused, _left, _title, moved = await self._repoint_route(
                 source, session_key, current_entry, target_id, local_owner, authority,
                 busy_guard=lambda: t("gateway.busy.another_turn_running")
                 if self._is_session_running(session_key) else None,
-                settled_guard=settled_guard)
-            if refused is None:
+                settled_guard=settled_guard, expected_session_id=current_entry.session_id)
+            if refused is None and moved:
                 # One-shot: platforms that stamp every thread message with the thread root (Slack
-                # thread_ts, BlueBubbles) would otherwise undo a later /new or /resume.
+                # thread_ts, BlueBubbles) would otherwise undo a later /new or /resume. A CAS
+                # refusal (the lane moved mid-flight) leaves the handle live.
                 await asyncio.to_thread(rich_sent_store.record_marker, chat_key, [reply_id], "session", "")
             return refused
         except Exception as e:
@@ -1326,7 +1334,7 @@ class GatewaySessionCommandsMixin:
         current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
-        refused, left_count, title = await self._repoint_route(
+        refused, left_count, title, _moved = await self._repoint_route(
             source, session_key, current_entry, target_id, local_owner, authority, fallback_title=name)
         if refused is not None:
             return refused
