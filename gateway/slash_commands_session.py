@@ -1245,10 +1245,15 @@ class GatewaySessionCommandsMixin:
         not processed) only when either conversation is mid-turn: moving the route then would orphan
         the running turn here or race a second turn into the target's."""
         from gateway import rich_sent_store
+        from gateway.session_ingress import executing_admission
         from gateway.session_route_recovery import conversation_head, settled_handoff_db
         reply_id = getattr(event, "reply_to_message_id", None)
-        if (is_internal or not reply_id or event.get_command() or getattr(source, "is_bot", False)
+        if (executing_admission.get()
+                or is_internal or not reply_id or event.get_command() or getattr(source, "is_bot", False)
                 or self._session_db is None or self._is_shared_session_source(source)):
+            # The executing pass of an already-admitted event must not re-decide routing: its route
+            # was set (or the CAS refused it) at ingress, and a fresh snapshot here would undo an
+            # acknowledged /new or /resume — the same rule the other admission-time intercepts follow.
             return None
         chat_key = f"{source.platform.value}:{source.chat_id}"
         try:

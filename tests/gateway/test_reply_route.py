@@ -234,6 +234,82 @@ async def test_the_reply_switch_compares_against_its_own_snapshot(tmp_path, inde
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["new", "resume"])
+async def test_a_command_acknowledged_during_the_preflight_survives_the_execution_pass(
+        tmp_path, monkeypatch, replacement):
+    """Real-handler proof that routing is admission-once: a stale reply whose ingress switch the
+    compare-and-swap refuses must not re-route during the durable execution pass either — the
+    acknowledged /new (or /resume) keeps the lane, the reply runs there, the handle stays live."""
+    from dataclasses import replace as dc_replace
+
+    from gateway.session_ingress import executing_admission
+    from gateway.session_local import create_local_session
+    from tests.gateway.test_authority_lane_moves_on import _app, _chat, _gateway
+    from tests.waiting import async_wait_until
+
+    runner, adapter, authority, source, sent, ran, gates = await _gateway(monkeypatch)
+    runner.config.platforms.setdefault(
+        Platform.DISCORD, PlatformConfig(enabled=True, extra={})).extra["allow_admin_from"] = ["42"]
+    await _chat(adapter, source, sent, "initial-chat")
+    actor = _app()
+    creator = dc_replace(actor, capabilities=actor.capabilities | {"session:create"})
+    ref = create_local_session(authority, creator, dict(
+        request_id="origin", source="cli", cwd=str(tmp_path), model="frozen", toolsets=[]))
+    rich_sent_store.record_marker(f"discord:{source.chat_id}", ["q1"], "session", ref.session_id)
+    lane = runner._session_key_for_source(source)
+    initial = runner.session_store.peek_session_id(lane)
+    if replacement == "resume":
+        await _chat(adapter, source, sent, "/new")
+        await _chat(adapter, source, sent, "second-chat")
+        resume_target = runner.session_store.peek_session_id(lane)
+        await _chat(adapter, source, sent, f"/resume {initial}")
+
+    preflight = runner._telegram_topic_switch_conflict
+    acknowledged = []
+    replacement_id = []
+
+    async def interleaved(src, target):
+        result = await preflight(src, target)
+        if not acknowledged:  # the command lands during the awaited topic preflight
+            acknowledged.append("pending")
+            await _chat(adapter, source, sent,
+                        "/new" if replacement == "new" else f"/resume {resume_target}")
+            replacement_id.append(runner.session_store.peek_session_id(lane))
+            assert replacement_id[0] != initial
+        return result
+
+    passes = []
+    real_route = runner._route_reply_to_origin_session
+
+    async def route(*args, **kwargs):
+        passes.append(dict(executing=executing_admission.get(),
+                           route=runner.session_store.peek_session_id(lane)))
+        return await real_route(*args, **kwargs)
+
+    with patch.object(runner, "_telegram_topic_switch_conflict", interleaved), \
+            patch.object(runner, "_route_reply_to_origin_session", route):
+        await runner._handle_message(MessageEvent(
+            text="older-reply", source=source, message_id="r5", reply_to_message_id="q1"))
+    try:
+        assert replacement_id
+        # Both passes ran: the ingress pass (whose stale switch the CAS refused) and the durable
+        # execution pass — which must NOT re-route.
+        assert any(not p["executing"] for p in passes) and any(p["executing"] for p in passes)
+        assert runner.session_store.peek_session_id(lane) == replacement_id[0]
+        executions = [t for t in ran if t[0] == "older-reply"]
+        assert executions and executions[0][1] == replacement_id[0]
+        assert rich_sent_store.lookup_marker(
+            f"discord:{source.chat_id}", "q1", "session") == ref.session_id
+    finally:
+        for gate in gates.values():
+            gate.set()
+        await async_wait_until(
+            lambda: all(l.task is None or l.task.done() for l in authority.sessions.values()),
+            what="turns settle")
+        authority.db.close()
+
+
+@pytest.mark.asyncio
 async def test_a_command_sent_as_a_reply_is_left_to_command_dispatch(tmp_path, index):
     runner, db = _runner(tmp_path)
     runner._is_session_running = lambda key: True  # /stop must reach its handler, not a busy notice
