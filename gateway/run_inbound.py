@@ -1371,6 +1371,10 @@ class GatewayInboundMixin(
         if _reply is not None:
             return _reply
 
+        if not is_internal and (_route_notice := await self._route_reply_to_origin_session(
+                event, source, _quick_key)):
+            return _route_notice
+
         _owned, _authority_reply = await self._hm_authority_admission(event, source, _quick_key, is_internal)
         if _owned:
             return _authority_reply

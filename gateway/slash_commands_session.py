@@ -1177,6 +1177,86 @@ class GatewaySessionCommandsMixin:
             return None
         return t("gateway.resume.blocked_not_owner", name=name)
 
+    async def _repoint_route(self, source, session_key, current_entry, target_id, local_owner, authority):
+        """Point *session_key* at *target_id* the /resume way; shared with reply routing.
+        Returns ``(refusal text or None, departed-queue count, title or None)``."""
+        from gateway.session_route_recovery import follow_hand_off
+        conflict = await self._telegram_topic_switch_conflict(source, target_id)
+        if conflict is not None:
+            return conflict, 0, None
+        self._release_running_agent_state(session_key)
+        with self._telegram_topic_publication(source):
+            new_entry = await self.async_session_store.switch_session(
+                session_key, target_id, preserve_prompt_pin=False,
+            )
+            if not new_entry:
+                return t("gateway.resume.switch_failed"), 0, None
+            try:
+                await self._follow_telegram_topic_switch(source, new_entry, reason="resume-command",
+                                                         departed=current_entry)
+            except TopicLinkedElsewhere as refused:  # bound elsewhere since the check: route put back
+                return str(refused), 0, None
+        # /resume also leaves the paused chat's queued messages on the departed conversation.
+        # Count only after the route switched, as /new does, so fresh admissions use the new route.
+        left_count = await paused_followers(self, current_entry.session_id)
+        if local_owner is not None and authority is not None:  # a Desktop still viewing it follows it
+            follow_hand_off(authority, source, session_key, authority.logical_owner(target_id), local_owner)
+        # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
+        # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
+        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
+        self._clear_conversation_scope(session_key, reason="resume")
+        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
+        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
+        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
+        await self.async_session_store.set_model_override(session_key, None)
+        # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
+        # provider cached _session_id at initialize() and would keep writing to the wrong session.
+        self._evict_cached_agent(session_key)
+        title = await self._session_db.get_session_title(target_id)
+        await self._rename_telegram_topic_after_switch(source, new_entry, title)
+        return None, left_count, title
+
+    async def _route_reply_to_origin_session(self, event: MessageEvent, source, session_key: str) -> Optional[str]:
+        """A reply to a message a session sent continues that session. The message id is only a routing
+        handle: the sender must pass the /resume --all check for the target. A miss or lookup failure
+        keeps the normal route, silently. Returns a notice (the message is not processed) only when
+        either conversation is mid-turn: moving the route then would orphan the running turn here or
+        race a second turn into the target's."""
+        from gateway import rich_sent_store
+        from gateway.session_route_recovery import conversation_head, settled_handoff_db
+        reply_id = getattr(event, "reply_to_message_id", None)
+        if not reply_id or getattr(source, "is_bot", False) or self._session_db is None:
+            return None
+        try:
+            origin = await asyncio.to_thread(
+                rich_sent_store.lookup_marker, f"{source.platform.value}:{source.chat_id}", str(reply_id), "session")
+            if not origin:
+                return None
+            target_id = await self._session_db.resolve_resume_session_id(origin)
+            if await self._session_db.get_session(target_id) is None:
+                return None
+            authority, local_owner, head = await conversation_head(self, target_id)
+            if local_owner is not None:
+                target_id = head
+            current_entry = await self.async_session_store.get_or_create_session(source)
+            if current_entry.session_id == target_id:
+                return None
+            if await self._resume_access_denied_reply(source, target_id, target_id, True, False) is not None:
+                return None
+        except Exception as e:
+            logger.debug("Reply routing to origin session failed; keeping the normal route: %s", e)
+            return None
+        busy = "⏳ That conversation is mid-turn. Send your reply again once it finishes (or /stop it first)."
+        if self._is_session_running(session_key):
+            return busy
+        try:
+            await settled_handoff_db(self, authority, target_id)
+        except RuntimeError:
+            return busy
+        refused, _left, _title = await self._repoint_route(
+            source, session_key, current_entry, target_id, local_owner, authority)
+        return refused
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:
@@ -1204,7 +1284,7 @@ class GatewaySessionCommandsMixin:
         target_id, name = resolved
         # A local conversation moves onto this lane from its current head, as /handoff carries it: a
         # title naming its first segment (a local /new moved on) would strand the live one (#143286).
-        from gateway.session_route_recovery import conversation_head, follow_hand_off
+        from gateway.session_route_recovery import conversation_head
         authority, local_owner, head = await conversation_head(self, target_id)
         if local_owner is not None:
             target_id = head
@@ -1214,40 +1294,11 @@ class GatewaySessionCommandsMixin:
         current_entry = await self.async_session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
-        conflict = await self._telegram_topic_switch_conflict(source, target_id)
-        if conflict is not None:
-            return conflict
-        self._release_running_agent_state(session_key)
-        with self._telegram_topic_publication(source):
-            new_entry = await self.async_session_store.switch_session(
-                session_key, target_id, preserve_prompt_pin=False,
-            )
-            if not new_entry:
-                return t("gateway.resume.switch_failed")
-            try:
-                await self._follow_telegram_topic_switch(source, new_entry, reason="resume-command",
-                                                         departed=current_entry)
-            except TopicLinkedElsewhere as refused:  # bound elsewhere since the check: route put back
-                return str(refused)
-        # /resume also leaves the paused chat's queued messages on the departed conversation.
-        # Count only after the route switched, as /new does, so fresh admissions use the new route.
-        left_count = await paused_followers(self, current_entry.session_id)
-        if local_owner is not None and authority is not None:  # a Desktop still viewing it follows it
-            follow_hand_off(authority, source, session_key, authority.logical_owner(target_id), local_owner)
-        # Conversation boundary: all conversation-scoped state + security state in one funnel call.
-        # Conversation boundary: clear ALL conversation-scoped per-session state (model/reasoning overrides
-        # #10702, one-turn restores, model notes, last-resolved cache #58403, /queue overflow) + security
-        # state in one funnel call. See _CONVERSATION_SCOPED_STATE in gateway/run.py.
-        self._clear_conversation_scope(session_key, reason="resume")
-        # switch_session keeps the route's persisted /model pin (a re-pin is not a boundary,
-        # #119864); /resume IS one, and the funnel above clears only in-memory state — without this
-        # the next turn's _rehydrate_session_model_override resurrects the pin it just cleared.
-        await self.async_session_store.set_model_override(session_key, None)
-        # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
-        # provider cached _session_id at initialize() and would keep writing to the wrong session.
-        self._evict_cached_agent(session_key)
-        title = await self._session_db.get_session_title(target_id) or name
-        await self._rename_telegram_topic_after_switch(source, new_entry, title)
+        refused, left_count, title = await self._repoint_route(
+            source, session_key, current_entry, target_id, local_owner, authority)
+        if refused is not None:
+            return refused
+        title = title or name
         left_notice = (t("gateway.reset.paused_left", count=left_count,
                          session_id=current_entry.session_id, discard=discard_command_for(source))
                        if left_count else "")

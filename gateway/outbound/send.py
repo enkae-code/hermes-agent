@@ -223,6 +223,13 @@ def _handle_send(args):
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
         if isinstance(result, dict) and result.get("success"):
+            # A reply to what this session sent routes back here (gateway/run_inbound.py reply routing).
+            from gateway import rich_sent_store
+            from gateway.session_context import get_session_env
+            if session_id := get_session_env("HERMES_SESSION_ID"):
+                rich_sent_store.record_marker(f"{platform_name}:{chat_id}",
+                                              result.get("delivered_message_ids") or [result.get("message_id")],
+                                              "session", session_id)
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
             if mirror_text and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):
