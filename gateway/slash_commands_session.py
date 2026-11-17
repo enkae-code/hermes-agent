@@ -1177,7 +1177,8 @@ class GatewaySessionCommandsMixin:
             return None
         return t("gateway.resume.blocked_not_owner", name=name)
 
-    async def _repoint_route(self, source, session_key, current_entry, target_id, local_owner, authority):
+    async def _repoint_route(self, source, session_key, current_entry, target_id, local_owner, authority,
+                             fallback_title=None):
         """Point *session_key* at *target_id* the /resume way; shared with reply routing.
         Returns ``(refusal text or None, departed-queue count, title or None)``."""
         from gateway.session_route_recovery import follow_hand_off
@@ -1212,24 +1213,26 @@ class GatewaySessionCommandsMixin:
         # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
         # provider cached _session_id at initialize() and would keep writing to the wrong session.
         self._evict_cached_agent(session_key)
-        title = await self._session_db.get_session_title(target_id)
+        title = await self._session_db.get_session_title(target_id) or fallback_title
         await self._rename_telegram_topic_after_switch(source, new_entry, title)
         return None, left_count, title
 
     async def _route_reply_to_origin_session(self, event: MessageEvent, source, session_key: str) -> Optional[str]:
-        """A reply to a message a session sent continues that session. The message id is only a routing
-        handle: the sender must pass the /resume --all check for the target. A miss or lookup failure
-        keeps the normal route, silently. Returns a notice (the message is not processed) only when
-        either conversation is mid-turn: moving the route then would orphan the running turn here or
-        race a second turn into the target's."""
+        """A reply to a message a local session sent continues that session, once. The message id is
+        only a routing handle: the sender must pass the /resume --all check for the target. Commands,
+        bots and shared group/thread lanes never route (a member's Reply must not move everyone's
+        lane); a miss or failure keeps the normal route, silently. Returns a notice (the message is
+        not processed) only when either conversation is mid-turn: moving the route then would orphan
+        the running turn here or race a second turn into the target's."""
         from gateway import rich_sent_store
         from gateway.session_route_recovery import conversation_head, settled_handoff_db
         reply_id = getattr(event, "reply_to_message_id", None)
-        if not reply_id or getattr(source, "is_bot", False) or self._session_db is None:
+        if (not reply_id or event.get_command() or getattr(source, "is_bot", False)
+                or self._session_db is None or self._is_shared_session_source(source)):
             return None
+        chat_key = f"{source.platform.value}:{source.chat_id}"
         try:
-            origin = await asyncio.to_thread(
-                rich_sent_store.lookup_marker, f"{source.platform.value}:{source.chat_id}", str(reply_id), "session")
+            origin = await asyncio.to_thread(rich_sent_store.lookup_marker, chat_key, str(reply_id), "session")
             if not origin:
                 return None
             target_id = await self._session_db.resolve_resume_session_id(origin)
@@ -1243,19 +1246,25 @@ class GatewaySessionCommandsMixin:
                 return None
             if await self._resume_access_denied_reply(source, target_id, target_id, True, False) is not None:
                 return None
+            if self._is_session_running(session_key):
+                return t("gateway.busy.another_turn_running")
+            try:
+                await settled_handoff_db(self, authority, target_id)
+            except RuntimeError:  # the /handoff refusal: durable work still owns the target
+                return t("gateway.busy.another_turn_running")
+            # Re-checked after the awaits above: a turn admitted meanwhile must not be released.
+            if self._is_session_running(session_key):
+                return t("gateway.busy.another_turn_running")
+            refused, _left, _title = await self._repoint_route(
+                source, session_key, current_entry, target_id, local_owner, authority)
+            if refused is None:
+                # One-shot: platforms that stamp every thread message with the thread root (Slack
+                # thread_ts, BlueBubbles) would otherwise undo a later /new or /resume.
+                await asyncio.to_thread(rich_sent_store.record_marker, chat_key, [reply_id], "session", "")
+            return refused
         except Exception as e:
             logger.debug("Reply routing to origin session failed; keeping the normal route: %s", e)
             return None
-        busy = "⏳ That conversation is mid-turn. Send your reply again once it finishes (or /stop it first)."
-        if self._is_session_running(session_key):
-            return busy
-        try:
-            await settled_handoff_db(self, authority, target_id)
-        except RuntimeError:
-            return busy
-        refused, _left, _title = await self._repoint_route(
-            source, session_key, current_entry, target_id, local_owner, authority)
-        return refused
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
@@ -1295,7 +1304,7 @@ class GatewaySessionCommandsMixin:
         if current_entry.session_id == target_id:
             return t("gateway.resume.already_on", name=name)
         refused, left_count, title = await self._repoint_route(
-            source, session_key, current_entry, target_id, local_owner, authority)
+            source, session_key, current_entry, target_id, local_owner, authority, fallback_title=name)
         if refused is not None:
             return refused
         title = title or name

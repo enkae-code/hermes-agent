@@ -136,7 +136,7 @@ async def test_reply_while_this_chat_is_mid_turn_is_held_not_routed(tmp_path, in
     event = _reply("m1", _source(user_id="99"))
     notice = await runner._route_reply_to_origin_session(event, event.source, KEY)
 
-    assert "mid-turn" in notice
+    assert "still running" in notice
     assert _switched_to(runner) == []
 
 
@@ -155,8 +155,80 @@ async def test_reply_to_a_conversation_still_running_elsewhere_is_held(tmp_path,
     event = _reply("m1", _source(user_id="99"))
     notice = await runner._route_reply_to_origin_session(event, event.source, KEY)
 
-    assert "mid-turn" in notice
+    assert "still running" in notice
     assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_a_turn_admitted_during_the_settled_check_is_not_released(tmp_path, index, monkeypatch):
+    import gateway.session_route_recovery as recovery
+
+    runner, db = _runner(tmp_path)
+    running = set()
+    runner._is_session_running = lambda key: key in running
+
+    async def turn_starts_meanwhile(_runner, _authority, _session_id):
+        running.add(KEY)
+
+    monkeypatch.setattr(recovery, "settled_handoff_db", turn_starts_meanwhile)
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    event = _reply("m1", _source(user_id="99"))
+    notice = await runner._route_reply_to_origin_session(event, event.source, KEY)
+
+    assert "still running" in notice
+    assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_a_command_sent_as_a_reply_is_left_to_command_dispatch(tmp_path, index):
+    runner, db = _runner(tmp_path)
+    runner._is_session_running = lambda key: True  # /stop must reach its handler, not a busy notice
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    event = MessageEvent(text="/stop", source=_source(user_id="99"), reply_to_message_id="m1")
+    assert await runner._route_reply_to_origin_session(event, event.source, KEY) is None
+    assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_a_reply_in_a_shared_group_lane_is_not_routed(tmp_path, index):
+    runner, db = _runner(tmp_path)
+    runner._is_shared_session_source = lambda _source: True
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    event = _reply("m1", _source(user_id="99"))
+    await runner._route_reply_to_origin_session(event, event.source, KEY)
+
+    assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_a_routed_reply_id_is_spent_so_a_later_new_sticks(tmp_path, index):
+    runner, db = _runner(tmp_path)
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    first = _reply("m1", _source(user_id="99"))
+    await runner._route_reply_to_origin_session(first, first.source, KEY)
+    again = _reply("m1", _source(user_id="99"))  # e.g. a Slack thread stamping every message
+    await runner._route_reply_to_origin_session(again, again.source, KEY)
+
+    assert _switched_to(runner) == ["origin"]
+
+
+@pytest.mark.asyncio
+async def test_resume_of_an_untitled_session_still_renames_the_topic_to_its_name(tmp_path, index):
+    runner, db = _runner(tmp_path)
+    runner._rename_telegram_topic_after_switch = AsyncMock()
+    _session(db, "untitled-id")
+
+    await runner._handle_resume_command(MessageEvent(text="/resume untitled-id", source=_source()))
+
+    assert runner._rename_telegram_topic_after_switch.await_args.args[2] == "untitled-id"
 
 
 @pytest.mark.asyncio
@@ -176,8 +248,10 @@ def test_send_records_origin_only_with_session_env(index, monkeypatch):
 
     tg_cfg = SimpleNamespace(enabled=True, token="t", extra={})
     config = SimpleNamespace(platforms={Platform.TELEGRAM: tg_cfg}, get_home_channel=lambda _p: None)
-    def send(env, message_id):
+    def send(env, message_id, source="desktop"):
         monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", source)
         if env:
             monkeypatch.setenv("HERMES_SESSION_ID", env)
         sent = {"success": True, "message_id": message_id}
@@ -194,3 +268,6 @@ def test_send_records_origin_only_with_session_env(index, monkeypatch):
 
     send(None, "78")
     assert index.lookup_marker("telegram:67890", "78", "session") is None
+
+    send("sess_cron", "79", source="cron")  # cron/messaging turns are not a conversation to continue
+    assert index.lookup_marker("telegram:67890", "79", "session") is None
