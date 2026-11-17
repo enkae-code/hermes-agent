@@ -221,6 +221,65 @@ async def test_a_routed_reply_id_is_spent_so_a_later_new_sticks(tmp_path, index)
 
 
 @pytest.mark.asyncio
+async def test_a_turn_started_during_the_topic_preflight_is_not_released(tmp_path, index):
+    runner, db = _runner(tmp_path)
+    running = set()
+    runner._is_session_running = lambda key: key in running
+
+    async def preflight(_source, _target):
+        running.add(KEY)  # a turn acquires the lane during the real preflight's await
+        await asyncio.sleep(0)
+
+    runner._telegram_topic_switch_conflict = preflight
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    event = _reply("m1", _source(user_id="99"))
+    notice = await runner._route_reply_to_origin_session(event, event.source, KEY)
+
+    assert "still running" in notice
+    assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_a_reply_when_the_target_is_already_on_this_route_spends_the_handle(tmp_path, index):
+    runner, db = _runner(tmp_path)
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    # /resume (or an earlier reply) already pointed this chat at origin: the reply continues
+    # there without a switch, but the handle is spent.
+    runner.session_store.get_or_create_session.return_value = MagicMock(session_id="origin", session_key=KEY)
+    await runner._route_reply_to_origin_session(_reply("m1", _source(user_id="99")),
+                                                _source(user_id="99"), KEY)
+    assert _switched_to(runner) == []
+
+    # A later /new changes the route; the spent handle must not pull it back.
+    runner.session_store.get_or_create_session.return_value = MagicMock(session_id="after-new", session_key=KEY)
+    await runner._route_reply_to_origin_session(_reply("m1", _source(user_id="99")),
+                                                _source(user_id="99"), KEY)
+    assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
+async def test_a_title_failure_after_the_switch_still_lands_the_route(tmp_path, index):
+    runner, db = _runner(tmp_path)
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+    runner._session_db.get_session_title = AsyncMock(side_effect=RuntimeError("db gone"))
+
+    notice = await runner._route_reply_to_origin_session(_reply("m1", _source(user_id="99")),
+                                                         _source(user_id="99"), KEY)
+
+    assert notice is None  # metadata failing after the switch is not a routing failure
+    assert _switched_to(runner) == ["origin"]
+    runner.session_store.get_or_create_session.return_value = MagicMock(session_id="after-new", session_key=KEY)
+    await runner._route_reply_to_origin_session(_reply("m1", _source(user_id="99")),
+                                                _source(user_id="99"), KEY)
+    assert _switched_to(runner) == ["origin"]  # handle spent despite the late metadata error
+
+
+@pytest.mark.asyncio
 async def test_resume_of_an_untitled_session_still_renames_the_topic_to_its_name(tmp_path, index):
     runner, db = _runner(tmp_path)
     runner._rename_telegram_topic_after_switch = AsyncMock()

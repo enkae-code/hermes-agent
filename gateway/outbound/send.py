@@ -29,6 +29,21 @@ _SLACK_USER_ID_RE = re.compile(r"^\s*(U[A-Z0-9]{8,})\s*$")
 # Session sources whose sends make a reply in the target chat continue that session.
 _LOCAL_REPLY_ORIGIN_SOURCES = frozenset({"cli", "desktop", "tui"})
 
+def _record_reply_origin(platform_name: str, chat_id, result: dict) -> None:
+    """A reply to what a local session (Desktop/CLI/TUI) sent routes back to it (gateway reply
+    routing). Cron and messaging turns are excluded: their sessions are not a conversation the
+    operator continues from a chat."""
+    from gateway.session_context import get_session_env
+    if (get_session_env("HERMES_SESSION_SOURCE") not in _LOCAL_REPLY_ORIGIN_SOURCES
+            or get_session_env("HERMES_SESSION_PLATFORM")
+            or not (session_id := get_session_env("HERMES_SESSION_ID"))):
+        return
+    from gateway import rich_sent_store
+    rich_sent_store.record_marker(f"{platform_name}:{chat_id}",
+                                  result.get("delivered_message_ids") or [result.get("message_id")],
+                                  "session", session_id)
+
+
 # NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
 # (the agent must not fire cross-platform messages on its own); cron delivery, the
 # ``hermes send`` CLI, the kanban notifier and the opt-in MCP server import the helpers.
@@ -226,17 +241,7 @@ def _handle_send(args):
                                               media_files=media_files, force_document=force_document_attachments,
                                               **handler_args))
         if isinstance(result, dict) and result.get("success"):
-            # A reply to what a local session (Desktop/CLI/TUI) sent routes back to it (gateway reply
-            # routing). Cron and messaging turns are excluded: their sessions are not a conversation
-            # the operator continues from a chat.
-            from gateway import rich_sent_store
-            from gateway.session_context import get_session_env
-            if (get_session_env("HERMES_SESSION_SOURCE") in _LOCAL_REPLY_ORIGIN_SOURCES
-                    and not get_session_env("HERMES_SESSION_PLATFORM")
-                    and (session_id := get_session_env("HERMES_SESSION_ID"))):
-                rich_sent_store.record_marker(f"{platform_name}:{chat_id}",
-                                              result.get("delivered_message_ids") or [result.get("message_id")],
-                                              "session", session_id)
+            _record_reply_origin(platform_name, chat_id, result)
             if used_home_channel:
                 result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
             if mirror_text and _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):

@@ -1178,13 +1178,17 @@ class GatewaySessionCommandsMixin:
         return t("gateway.resume.blocked_not_owner", name=name)
 
     async def _repoint_route(self, source, session_key, current_entry, target_id, local_owner, authority,
-                             fallback_title=None):
+                             fallback_title=None, busy_guard=None):
         """Point *session_key* at *target_id* the /resume way; shared with reply routing.
-        Returns ``(refusal text or None, departed-queue count, title or None)``."""
+        Returns ``(refusal text or None, departed-queue count, title or None)``. *busy_guard*
+        (reply routing only) runs synchronously here — after the awaited topic preflight, with no
+        await before the release — so a turn admitted during the awaits above is never released."""
         from gateway.session_route_recovery import follow_hand_off
         conflict = await self._telegram_topic_switch_conflict(source, target_id)
         if conflict is not None:
             return conflict, 0, None
+        if busy_guard is not None and (guard_notice := busy_guard()) is not None:
+            return guard_notice, 0, None
         self._release_running_agent_state(session_key)
         with self._telegram_topic_publication(source):
             new_entry = await self.async_session_store.switch_session(
@@ -1213,11 +1217,16 @@ class GatewaySessionCommandsMixin:
         # Evict so the next turn rebuilds with the right session_id — the cached AIAgent's memory
         # provider cached _session_id at initialize() and would keep writing to the wrong session.
         self._evict_cached_agent(session_key)
-        title = await self._session_db.get_session_title(target_id) or fallback_title
-        await self._rename_telegram_topic_after_switch(source, new_entry, title)
+        try:
+            title = await self._session_db.get_session_title(target_id) or fallback_title
+            await self._rename_telegram_topic_after_switch(source, new_entry, title)
+        except Exception as e:  # metadata only: the switch above already succeeded
+            logger.debug("Post-switch title/topic rename failed (route already moved): %s", e, exc_info=True)
+            title = fallback_title
         return None, left_count, title
 
-    async def _route_reply_to_origin_session(self, event: MessageEvent, source, session_key: str) -> Optional[str]:
+    async def _route_reply_to_origin_session(self, event: MessageEvent, source, session_key: str,
+                                             is_internal: bool = False) -> Optional[str]:
         """A reply to a message a local session sent continues that session, once. The message id is
         only a routing handle: the sender must pass the /resume --all check for the target. Commands,
         bots and shared group/thread lanes never route (a member's Reply must not move everyone's
@@ -1227,7 +1236,7 @@ class GatewaySessionCommandsMixin:
         from gateway import rich_sent_store
         from gateway.session_route_recovery import conversation_head, settled_handoff_db
         reply_id = getattr(event, "reply_to_message_id", None)
-        if (not reply_id or event.get_command() or getattr(source, "is_bot", False)
+        if (is_internal or not reply_id or event.get_command() or getattr(source, "is_bot", False)
                 or self._session_db is None or self._is_shared_session_source(source)):
             return None
         chat_key = f"{source.platform.value}:{source.chat_id}"
@@ -1243,6 +1252,9 @@ class GatewaySessionCommandsMixin:
                 target_id = head
             current_entry = await self.async_session_store.get_or_create_session(source)
             if current_entry.session_id == target_id:
+                # Already there (a /resume or earlier reply): the continuation happened, so spend
+                # the handle — a repeated thread-root id must not undo a later /new.
+                await asyncio.to_thread(rich_sent_store.record_marker, chat_key, [reply_id], "session", "")
                 return None
             if await self._resume_access_denied_reply(source, target_id, target_id, True, False) is not None:
                 return None
@@ -1252,18 +1264,18 @@ class GatewaySessionCommandsMixin:
                 await settled_handoff_db(self, authority, target_id)
             except RuntimeError:  # the /handoff refusal: durable work still owns the target
                 return t("gateway.busy.another_turn_running")
-            # Re-checked after the awaits above: a turn admitted meanwhile must not be released.
-            if self._is_session_running(session_key):
-                return t("gateway.busy.another_turn_running")
             refused, _left, _title = await self._repoint_route(
-                source, session_key, current_entry, target_id, local_owner, authority)
+                source, session_key, current_entry, target_id, local_owner, authority,
+                busy_guard=lambda: t("gateway.busy.another_turn_running")
+                if self._is_session_running(session_key) else None)
             if refused is None:
                 # One-shot: platforms that stamp every thread message with the thread root (Slack
                 # thread_ts, BlueBubbles) would otherwise undo a later /new or /resume.
                 await asyncio.to_thread(rich_sent_store.record_marker, chat_key, [reply_id], "session", "")
             return refused
         except Exception as e:
-            logger.debug("Reply routing to origin session failed; keeping the normal route: %s", e)
+            logger.debug("Reply routing to origin session failed; keeping the normal route: %s", e,
+                         exc_info=True)
             return None
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
