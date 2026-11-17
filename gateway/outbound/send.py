@@ -30,13 +30,18 @@ _SLACK_USER_ID_RE = re.compile(r"^\s*(U[A-Z0-9]{8,})\s*$")
 _LOCAL_REPLY_ORIGIN_SOURCES = frozenset({"cli", "desktop", "tui"})
 
 def _record_reply_origin(platform_name: str, chat_id, result: dict) -> None:
-    """A reply to what a local session (Desktop/CLI/TUI) sent routes back to it (gateway reply
-    routing). Cron and messaging turns are excluded: their sessions are not a conversation the
-    operator continues from a chat."""
+    """A reply to what a local session sent routes back to it (gateway reply routing). Only the
+    local surfaces qualify: a canonical local turn binds platform='local' (Desktop/CLI/TUI,
+    gateway/run.py ``build_session_context``); the legacy sidecar/CLI path binds no platform with
+    source cli/desktop/tui. Cron ('cron', or no platform with no source) and messaging turns never
+    do: their sessions are not a conversation the operator continues from a chat."""
     from gateway.session_context import get_session_env
-    if (get_session_env("HERMES_SESSION_SOURCE") not in _LOCAL_REPLY_ORIGIN_SOURCES
-            or get_session_env("HERMES_SESSION_PLATFORM")
-            or not (session_id := get_session_env("HERMES_SESSION_ID"))):
+    platform = get_session_env("HERMES_SESSION_PLATFORM")
+    if (platform != "local"
+            and not (platform == ""
+                     and get_session_env("HERMES_SESSION_SOURCE") in _LOCAL_REPLY_ORIGIN_SOURCES)):
+        return
+    if not (session_id := get_session_env("HERMES_SESSION_ID")):
         return
     from gateway import rich_sent_store
     rich_sent_store.record_marker(f"{platform_name}:{chat_id}",

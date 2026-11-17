@@ -1178,15 +1178,19 @@ class GatewaySessionCommandsMixin:
         return t("gateway.resume.blocked_not_owner", name=name)
 
     async def _repoint_route(self, source, session_key, current_entry, target_id, local_owner, authority,
-                             fallback_title=None, busy_guard=None):
+                             fallback_title=None, busy_guard=None, settled_guard=None):
         """Point *session_key* at *target_id* the /resume way; shared with reply routing.
-        Returns ``(refusal text or None, departed-queue count, title or None)``. *busy_guard*
-        (reply routing only) runs synchronously here — after the awaited topic preflight, with no
-        await before the release — so a turn admitted during the awaits above is never released."""
+        Returns ``(refusal text or None, departed-queue count, title or None)``. *settled_guard*
+        (reply routing only) re-runs the target's ``require_settled`` fence on a write transaction
+        as the last await before the move — the /handoff watcher's own pattern, where an admission
+        later than the fence wins by queueing. *busy_guard* then runs synchronously, with no await
+        before the release, so a turn admitted during the awaits above is never released."""
         from gateway.session_route_recovery import follow_hand_off
         conflict = await self._telegram_topic_switch_conflict(source, target_id)
         if conflict is not None:
             return conflict, 0, None
+        if settled_guard is not None and (settled_notice := await settled_guard()) is not None:
+            return settled_notice, 0, None
         if busy_guard is not None and (guard_notice := busy_guard()) is not None:
             return guard_notice, 0, None
         self._release_running_agent_state(session_key)
@@ -1260,14 +1264,21 @@ class GatewaySessionCommandsMixin:
                 return None
             if self._is_session_running(session_key):
                 return t("gateway.busy.another_turn_running")
-            try:
-                await settled_handoff_db(self, authority, target_id)
-            except RuntimeError:  # the /handoff refusal: durable work still owns the target
-                return t("gateway.busy.another_turn_running")
+
+            async def settled_guard():
+                """The target's durable-work fence, re-run inside _repoint_route after every
+                earlier await: a turn admitted meanwhile must not be moved onto the lane."""
+                try:
+                    await settled_handoff_db(self, authority, target_id)
+                except RuntimeError:  # the /handoff refusal: durable work still owns the target
+                    return t("gateway.busy.another_turn_running")
+                return None
+
             refused, _left, _title = await self._repoint_route(
                 source, session_key, current_entry, target_id, local_owner, authority,
                 busy_guard=lambda: t("gateway.busy.another_turn_running")
-                if self._is_session_running(session_key) else None)
+                if self._is_session_running(session_key) else None,
+                settled_guard=settled_guard)
             if refused is None:
                 # One-shot: platforms that stamp every thread message with the thread root (Slack
                 # thread_ts, BlueBubbles) would otherwise undo a later /new or /resume.

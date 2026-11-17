@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway import rich_sent_store
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, build_session_key
 
@@ -182,6 +182,26 @@ async def test_a_turn_admitted_during_the_settled_check_is_not_released(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_work_admitted_on_the_target_during_the_preflight_holds_the_route(tmp_path, index, monkeypatch):
+    runner, db = _runner(tmp_path)
+    runner._is_session_running = lambda key: False
+    import gateway.session_route_recovery as recovery
+
+    async def busy_target(_runner, _authority, _session_id):
+        raise RuntimeError("wait for the current turn to finish")
+
+    monkeypatch.setattr(recovery, "settled_handoff_db", busy_target)
+    _session(db, "origin")
+    index.record_marker(f"telegram:{CHAT}", ["m1"], "session", "origin")
+
+    event = _reply("m1", _source(user_id="99"))
+    notice = await runner._route_reply_to_origin_session(event, event.source, KEY)
+
+    assert "still running" in notice
+    assert _switched_to(runner) == []
+
+
+@pytest.mark.asyncio
 async def test_a_command_sent_as_a_reply_is_left_to_command_dispatch(tmp_path, index):
     runner, db = _runner(tmp_path)
     runner._is_session_running = lambda key: True  # /stop must reach its handler, not a busy notice
@@ -219,6 +239,80 @@ async def test_a_routed_reply_id_is_spent_so_a_later_new_sticks(tmp_path, index)
 
     assert _switched_to(runner) == ["origin"]
 
+
+
+
+@pytest.mark.asyncio
+async def test_a_real_local_turn_send_records_origin_and_a_reply_continues_it(tmp_path, monkeypatch):
+    """Handler-level proof, end to end: a real local (Desktop/CLI/TUI) session's turn sends to a
+    chat, the marker persists, a reply through the real _handle_message continues that session, and
+    a later /new wins over the spent handle."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, patch
+
+    from gateway.outbound.send import send_message_tool
+    from gateway.session_context import get_session_env
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import build_session_context
+    from gateway.session_contract import Submission
+    from gateway.session_local import create_local_session
+    from tests.gateway.test_authority_lane_moves_on import _app, _chat, _gateway
+    from tests.waiting import async_wait_until
+
+    actor = _app()
+    creator = replace(actor, capabilities=actor.capabilities | {"session:create"})
+    runner, adapter, authority, source, sent, ran, _gates = await _gateway(monkeypatch)
+    runner.config.platforms.setdefault(
+        Platform.DISCORD, PlatformConfig(enabled=True, extra={})).extra["allow_admin_from"] = ["42"]
+    await _chat(adapter, source, sent, "initial-chat")
+    ref = create_local_session(authority, creator, dict(
+        request_id="local-origin", source="cli", cwd=str(tmp_path), model="frozen", toolsets=[]))
+    local_source = authority.sessions[ref.session_id].source
+    entry = runner.session_store.get_or_create_session(local_source)
+    context = build_session_context(
+        local_source, runner.config, entry, MessageEvent(text="local turn", source=local_source))
+    tokens = runner._set_session_env(context)
+    try:
+        observed = {name: get_session_env(name) for name in (
+            "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_ID")}
+        assert observed["HERMES_SESSION_PLATFORM"] == "local" and observed["HERMES_SESSION_ID"]
+        config = SimpleNamespace(
+            platforms={Platform.DISCORD: SimpleNamespace(enabled=True, token="fixture", extra={})},
+            get_home_channel=lambda _p: None)
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+                patch("tools.interrupt.is_interrupted", return_value=False), \
+                patch("model_tools._run_async", side_effect=lambda coro: asyncio.run(coro)), \
+                patch("gateway.outbound.send._send_to_platform",
+                      new=AsyncMock(return_value={"success": True, "message_id": "local-ask"})), \
+                patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(await asyncio.to_thread(send_message_tool, {
+                "action": "send", "target": f"discord:{source.chat_id}",
+                "message": "question from the local session"}))
+        assert result["success"] is True, result
+        assert rich_sent_store.lookup_marker(f"discord:{source.chat_id}", "local-ask", "session") == ref.session_id
+
+        # The reply continues the local session; the handle is spent.
+        await runner._handle_message(MessageEvent(
+            text="first-reply", source=source, message_id="r1", reply_to_message_id="local-ask"))
+        await async_wait_until(lambda: any(t[0] == "first-reply" for t in ran), what="the reply ran")
+        assert next(t for t in ran if t[0] == "first-reply")[1] == ref.session_id
+        assert rich_sent_store.lookup_marker(f"discord:{source.chat_id}", "local-ask", "session") is None
+
+        # A later /new moves the lane; the spent handle must not pull it back.
+        await _chat(adapter, source, sent, "/new")
+        new_id = runner.session_store.peek_session_id(runner._session_key_for_source(source))
+        assert new_id != ref.session_id
+        await runner._handle_message(MessageEvent(
+            text="after-new", source=source, message_id="r2", reply_to_message_id="local-ask"))
+        await async_wait_until(lambda: any(t[0] == "after-new" for t in ran), what="the next reply ran")
+        assert next(t for t in ran if t[0] == "after-new")[1] == new_id
+    finally:
+        runner._clear_session_env(tokens)
+        await async_wait_until(
+            lambda: all(l.task is None or l.task.done() for l in authority.sessions.values()),
+            what="turns settle")
+        authority.db.close()
 
 @pytest.mark.asyncio
 async def test_a_turn_started_during_the_topic_preflight_is_not_released(tmp_path, index):
@@ -304,6 +398,7 @@ async def test_resume_still_switches_on_its_own_path(tmp_path, index):
 
 def test_send_records_origin_only_with_session_env(index, monkeypatch):
     from gateway.outbound.send import send_message_tool
+    from gateway.session_context import get_session_env
 
     tg_cfg = SimpleNamespace(enabled=True, token="t", extra={})
     config = SimpleNamespace(platforms={Platform.TELEGRAM: tg_cfg}, get_home_channel=lambda _p: None)
