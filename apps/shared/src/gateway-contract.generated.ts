@@ -5207,6 +5207,7 @@ export interface CanonicalCreateParams {
   verbose?: boolean
   client_env?: Record<string, string> | null
   client?: CanonicalClientIdentity | null
+  fallback?: string | null
 }
 /** A client naming itself: ``name`` matches ``[a-z0-9][a-z0-9._-]{0,63}``, ``version`` is 1-64 printable ASCII without spaces. Attribution only (owners advertising ``session-client-v1``). */
 export interface CanonicalClientIdentity {

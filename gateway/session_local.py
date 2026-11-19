@@ -273,6 +273,18 @@ def staged_creation_follows(authority, actor, request_id):
     return isinstance(request, dict) and request.get('follow_profile_config') is True
 
 
+def _refuse_unless_static_key(authority, policy):
+    """Route lock (``fallback: "none"``): resolve the primary route the way execution does, fallback off,
+    and refuse unless the resolver selected a static API key. Runs before the creation commit."""
+    from gateway.session_policy import route_launch_key
+    from gateway.session_worker_construct import route_runtime
+    frozen, model = policy.effective(authority)
+    runtime, _ = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen), fallback=False)
+    if runtime.get('credential_kind') != 'api_key':
+        raise RuntimeStoreError('invalid_params', field='fallback',
+                                detail='the primary credential is not a static API key')
+
+
 def stage_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None, skills_prompt=None,
                         client_local=False, desktop_local=False):
     """Everything before the creation commit: the existing session's ref on an exact retry, else the
@@ -307,7 +319,6 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
             # Owner-stamped provenance (not create fields): a remote client cannot re-resolve the typed
             # `-m` alias against its own home, so resume and an exact retry compare a repeat against the
             # name, and ``route_derived`` names the fields the route (not the client) filled.
-            import json
             derived = sorted(key for key in ('provider', 'base_url') if key in params and key not in sent)
             policy = replace(policy, request_json=json.dumps(
                 {**json.loads(policy.request_json), 'model_requested': raw_model, 'route_derived': derived},
@@ -320,7 +331,6 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
                 # Follows its profile, so the provider the user connects later replaces the trial model.
                 marks[FOLLOW_ADOPTED] = True
         if marks:
-            import json
             policy = replace(policy, config_json=json.dumps({**json.loads(policy.config_json), **marks}))
     request_id = params.get('request_id', uuid.uuid4().hex)
     if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
@@ -342,7 +352,6 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
             raise RuntimeStoreError('invalid_params', field='request_id',
                                     detail='a resumed request_id must carry the same frozen request')
         import hmac
-        import json
         if 'model_requested' in json.loads(original.request_json):
             # An owner-resolved alias: its key came from the profile (a `.env` rotation is not a changed
             # request) and the client sent none, so one it sends now is a different request.
@@ -366,6 +375,8 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
     policy = bind_launch_key(authority, sid, policy, params.get("api_key"), config_secrets=private_secrets,
                              owner_key=client_key is None,  # an overlapping exact retry takes the held one
                              client_request=client_request)
+    if json.loads(policy.request_json).get('fallback') == 'none':
+        _refuse_unless_static_key(authority, policy)
     from gateway.session_local_recovery import local_source
     source = local_source(authority, sid, actor.subject)
     route = authority.runner.session_store._generate_session_key(source)

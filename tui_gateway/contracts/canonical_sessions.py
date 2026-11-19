@@ -64,6 +64,8 @@ class CanonicalCreateParams(ProfileParams):
     client_env: dict[str, str] | None = None
     # The creating client's self-declared label, echoed as ``session.info.client``; no policy reads it.
     client: CanonicalClientIdentity | None = None
+    # Route lock: ``"none"`` refuses the create unless the primary credential is a static API key.
+    fallback: str | None = None
 
 
 class CanonicalResumeParams(ProfileParams):
