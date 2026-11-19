@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import (  # custom_provider_pool_key_candidates is read via origin by runtime_provider_custom
-    AUTH_TYPE_OAUTH, CredentialPool, PooledCredential, _is_manual_source, credential_pool_matches_provider,
+    AUTH_TYPE_API_KEY, AUTH_TYPE_OAUTH, CredentialPool, PooledCredential, _is_manual_source, credential_pool_matches_provider,
     custom_provider_pool_key_candidates, load_pool,
 )
 from agent.secret_scope import get_secret_str
@@ -30,6 +30,7 @@ from hermes_cli.auth import (  # resolve_external_process_provider_credentials i
     resolve_qwen_runtime_credentials, resolve_api_key_provider_credentials,
     resolve_external_process_provider_credentials,
     has_usable_secret, is_actual_local_base_url, looks_like_openrouter_key, normalize_actual_base_url,
+    _IMPLICIT_ENV_VARS,
 )
 from hermes_cli import config as _config_mod
 from hermes_cli import models as _models  # attribute access keeps ``hermes_cli.models.<name>`` patches effective
@@ -358,11 +359,13 @@ _NO_ANTHROPIC_CREDENTIALS_MSG = ("No Anthropic credentials found. Run 'hermes au
 
 
 def _runtime(provider: str, api_mode: str, base_url: Any, api_key: Any, **extra: Any) -> dict[str, Any]:
-    """Build a resolved-runtime dict; ``extra`` carries source/requested_provider/provider-specific keys."""
+    """Build a resolved-runtime dict; ``extra`` carries source/requested_provider/provider-specific keys.
+    ``credential_kind`` defaults to ``"unknown"``; only a rung that provably selected a static API key passes ``"api_key"``."""
     if is_actual_route(provider, base_url):
         api_mode = "chat_completions"
         base_url = normalize_actual_base_url(base_url)
-    return {"provider": provider, "api_mode": api_mode, "base_url": base_url, "api_key": api_key, **extra}
+    return {"provider": provider, "api_mode": api_mode, "base_url": base_url, "api_key": api_key,
+            "credential_kind": "unknown", **extra}
 
 
 def _cfg_provider(model_cfg: dict[str, Any]) -> str:
@@ -645,8 +648,9 @@ def _resolve_runtime_from_pool_entry(*, provider: str, entry: PooledCredential, 
     base_url = _finalize_base_url(provider, api_mode, base_url)
     if declared:  # the URL's owner supplies the key; the built-in's pool rows are another account's
         return _runtime(provider, api_mode, base_url, entry_key, source="config:providers", requested_provider=requested_provider)
+    kind = "api_key" if getattr(entry, "auth_type", None) == AUTH_TYPE_API_KEY else "unknown"
     return _runtime(provider, api_mode, base_url, _pool_entry_api_key(entry), source=getattr(entry, "source", "pool"),
-                    credential_pool=pool, requested_provider=requested_provider)
+                    credential_pool=pool, requested_provider=requested_provider, credential_kind=kind)
 
 
 def _owned_url_credential(base_url: str, model_cfg: dict[str, Any], provider: str) -> tuple[bool, Any]:
@@ -1080,7 +1084,12 @@ def _api_key_provider_runtime(provider, pconfig, requested_provider, model_cfg, 
                                           target_model or model_cfg.get("default", ""), opencode_by_model=True)
     base_url = _finalize_base_url(provider, api_mode, base_url)
     api_key = _actual_local_key(provider, creds.get("api_key", ""), base_url)
-    return _runtime(provider, api_mode, base_url, api_key, source=creds.get("source", "env"), requested_provider=requested_provider)
+    source = creds.get("source", "env")
+    # Static key only when the selected source is this provider's own declared *_API_KEY env var.
+    kind = "api_key" if (source in pconfig.api_key_env_vars and str(source).endswith("_API_KEY")
+                         and source not in _IMPLICIT_ENV_VARS) else "unknown"
+    return _runtime(provider, api_mode, base_url, api_key, source=source, requested_provider=requested_provider,
+                    credential_kind=kind)
 
 
 # ── the resolution ladder ──────────────────────────────────────────────────────────────────
