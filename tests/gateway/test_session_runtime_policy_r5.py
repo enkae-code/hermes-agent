@@ -151,7 +151,8 @@ def test_endpoint_only_fallback_change_is_route_disagreement(tmp_path, monkeypat
     _no_pool(monkeypatch)
     key = hermes_home_key(tmp_path)
     runner = SimpleNamespace(
-        _fallback_model=[_entry("same")], _fallback_model_by_home={key: [_entry("same")]}
+        _fallback_model=[_entry("same")],
+        _fallback_model_by_home={key: [_entry("same")]},
     )
     agree = session_config._runner_chains_agree
     # The unchanged state agrees (the runner-wide slot equals live), so only the endpoint can differ below.

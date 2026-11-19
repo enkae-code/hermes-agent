@@ -14,7 +14,11 @@ from tests.gateway.test_session_busy_controls import owner
 from tests.gateway.test_session_runtime_policy_r4 import _policy_for, _seed_catalog
 from tests.gateway.test_session_runtime_policy_r5 import _samples
 
-OPENROUTER = {"provider": "openrouter", "default": "primary-model", "api_key": "SENTINEL-KEY"}
+OPENROUTER = {
+    "provider": "openrouter",
+    "default": "primary-model",
+    "api_key": "SENTINEL-KEY",
+}
 
 
 def _policy(raw):
@@ -43,13 +47,19 @@ def _catalog_stub(monkeypatch):
             api_key_env_vars=("DEEPSEEK_API_KEY",),
         ),
     }
-    monkeypatch.setattr(providers, "get_provider", lambda name, allow_network=True: defs.get(name))
+    monkeypatch.setattr(
+        providers, "get_provider", lambda name, allow_network=True: defs.get(name)
+    )
 
 
 @pytest.mark.platforms("linux")
 def test_openrouter_host_is_canonical_without_endpoint_override(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (home, _, desc):
+    with owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (
+        home,
+        _,
+        desc,
+    ):
         policy = _policy(_policy_for(home, desc)[0])
         assert policy["primary"]["endpoint_host"] == "openrouter.ai", policy
 
@@ -57,7 +67,11 @@ def test_openrouter_host_is_canonical_without_endpoint_override(tmp_path, monkey
 @pytest.mark.platforms("linux")
 def test_profile_env_custom_base_url_overrides_openrouter_host(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (home, _, desc):
+    with owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (
+        home,
+        _,
+        desc,
+    ):
         (home / ".env").write_text("CUSTOM_BASE_URL=https://evil.example.test/v1\n")
         raw, _ = _policy_for(home, desc)
         policy = _policy(raw)
@@ -71,7 +85,9 @@ def test_custom_base_url_in_process_env_makes_static_route_host_unknown(monkeypa
     _catalog_stub(monkeypatch)
     entry = {"provider": "openrouter", "model": "m", "api_key": "SENTINEL-KEY"}
     assert session_config._host(session_config._route(entry, "m")[1]) == "openrouter.ai"
-    assert session_config._route(entry, "m", env=frozenset({"CUSTOM_BASE_URL"}))[1] == ""
+    assert (
+        session_config._route(entry, "m", env=frozenset({"CUSTOM_BASE_URL"}))[1] == ""
+    )
     monkeypatch.setenv("CUSTOM_BASE_URL", "https://evil.example.test/v1")
     assert session_config._route(entry, "m")[1] == ""
 
@@ -102,39 +118,52 @@ def test_canonical_or_empty_pool_row_base_url_keeps_host(monkeypatch):
         {"auth_type": "api_key", "base_url": ""},
         {"auth_type": "api_key", "base_url": "https://api.deepseek.com/v1"},
     ):
-        monkeypatch.setattr(auth, "read_credential_pool", lambda provider=None, row=row: [row])
-        assert session_config._host(session_config._route(entry, "m")[1]) == "api.deepseek.com"
+        monkeypatch.setattr(
+            auth, "read_credential_pool", lambda provider=None, row=row: [row]
+        )
+        assert (
+            session_config._host(session_config._route(entry, "m")[1])
+            == "api.deepseek.com"
+        )
 
 
 def test_getter_never_invokes_secret_source_resolvers(tmp_path, monkeypatch):
-    import agent.secret_sources.command as command
-    import hermes_cli.env_loader as env_loader
+    from agent.secret_sources import command
+    from hermes_cli import env_loader
 
     home = tmp_path / "home"
     home.mkdir()
-    (home / "config.yaml").write_text(json.dumps({"model": OPENROUTER, "fallback_providers": []}))
+    (home / "config.yaml").write_text(
+        json.dumps({"model": OPENROUTER, "fallback_providers": []})
+    )
     calls = []
 
     def flag(*args, **kwargs):
         calls.append(args)
-        raise AssertionError("secret source resolver invoked by config.get runtime_policy")
+        raise AssertionError(
+            "secret source resolver invoked by config.get runtime_policy"
+        )
 
     monkeypatch.setattr(env_loader, "hydrate_profile_secret_sources", flag)
     monkeypatch.setattr(env_loader, "_hydrate_profile_secret_sources", flag)
     monkeypatch.setattr(command, "_run_helper", flag)
     connection = SimpleNamespace(
         native_owner=True,
-        authority=SimpleNamespace(profile_id=str(home), agent=lambda ref: None, runner=None),
+        authority=SimpleNamespace(
+            profile_id=str(home), agent=lambda ref: None, runner=None
+        ),
     )
     result = asyncio.run(
-        session_config.runtime_policy(connection, SimpleNamespace(session_id=None), {}, None)
+        session_config.runtime_policy(
+            connection, SimpleNamespace(session_id=None), {}, None
+        )
     )
     assert calls == []
     assert result["runtime_policy"]["complete"] is False
 
 
 def test_unpublished_secret_sources_are_unknown(tmp_path, monkeypatch):
-    import hermes_cli.env_loader as env_loader
+    from hermes_cli import env_loader
 
     monkeypatch.setattr(env_loader, "_APPLIED_HOMES", set())
     assert session_config._sources_unpublished(tmp_path, {"secrets": {"x": 1}}) is True
@@ -170,9 +199,13 @@ def test_declared_credential_in_fallback_entry_changes_chain_identity(monkeypatc
     _no_pool(monkeypatch)
     _catalog_stub(monkeypatch)
     plain = [{"provider": "openrouter", "model": "m"}]
-    declared = [{"provider": "openrouter", "model": "m", "key_env": "OPENROUTER_API_KEY"}]
-    assert session_config._chain_key(plain, frozenset(), False) != session_config._chain_key(
-        declared, frozenset(), False
-    )
+    declared = [
+        {"provider": "openrouter", "model": "m", "key_env": "OPENROUTER_API_KEY"}
+    ]
+    assert session_config._chain_key(
+        plain, frozenset(), False
+    ) != session_config._chain_key(declared, frozenset(), False)
     secret = [{"provider": "openrouter", "model": "m", "api_key": "SENTINEL-KEY"}]
-    assert "SENTINEL-KEY" not in json.dumps(session_config._chain_key(secret, frozenset(), False))
+    assert "SENTINEL-KEY" not in json.dumps(
+        session_config._chain_key(secret, frozenset(), False)
+    )
