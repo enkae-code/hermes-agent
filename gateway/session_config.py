@@ -277,15 +277,17 @@ def _static_key_route(provider, pdef):
     return all(isinstance(row, dict) and (row.get('auth_type') or 'api_key') == 'api_key' for row in rows)
 
 
-def _pool_bases_agree(provider, base):
-    """True when every credential-pool row of ``provider`` is empty or names ``base``'s host: execution takes the
-    selected row's own base_url. An unreadable pool is not agreement."""
+def _pool_bases_agree(provider, base, canonical):
+    """True when every credential-pool row of ``provider`` is empty, or names ``base``'s host or the built-in host:
+    execution takes the selected row's base_url, but rewrites a built-in one to the configured URL. A row on any other
+    host, or an unreadable pool, is not agreement."""
     from hermes_cli.auth import read_credential_pool
     try:
         rows = read_credential_pool(provider)
     except Exception:  # health: allow BLE001 -- fail closed: an unreadable pool may name another endpoint
         return False
-    return all(isinstance(row, dict) and (not row.get('base_url') or _host(row.get('base_url')) == _host(base))
+    hosts = {host for host in (_host(base), _host(canonical)) if host}
+    return all(isinstance(row, dict) and (not row.get('base_url') or _host(row.get('base_url')) in hosts)
                for row in rows)
 
 
@@ -299,7 +301,8 @@ def _pool_bases_agree(provider, base):
 #   <PDEF>_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY (env, .env) -> credential presence (kind), via _static_key_route.
 #   auth.json credential pool rows (read_credential_pool): auth_type (non-api_key or unreadable -> kind unknown,
 #     _static_key_route) and base_url (the selected row's base_url is the endpoint, runtime_provider.py:468-469,:599-614)
-#     -> every row's host must equal the projected host, else host unknown (_pool_bases_agree).
+#     -> every row's host must be the projected host or the built-in host (execution rewrites a built-in row to the
+#     configured URL), else host unknown (_pool_bases_agree). Path is not projected: host-level agreement only.
 #   config model.provider / model.base_url / model.api_key / model.api / model.key_env / model.api_mode: the primary
 #     route (primary source) and the live config (live); a disagreement -> incomplete (_runtime_policy agreed).
 #   providers: / custom_providers: entries (_named): a route through one is not catalog-derived -> unknown (named).
@@ -332,7 +335,7 @@ def _route(entry, model, key_present=False, env=frozenset(), named=False):
     overrides = {'CUSTOM_BASE_URL', *([pdef.base_url_env_var] if pdef and pdef.base_url_env_var else [])}
     if any(var in env or os.environ.get(var, '').strip() for var in overrides):
         base = ''
-    if pdef and provider in _STATIC_KEY_PROVIDERS and not _pool_bases_agree(provider, base):
+    if pdef and provider in _STATIC_KEY_PROVIDERS and not _pool_bases_agree(provider, base, pdef.base_url):
         base = ''
     if named or not isinstance(base, str) or '$' in base:
         base = ''
@@ -461,6 +464,15 @@ def _hook_identity():
     return _loaded_registry_nowait(lambda manager: {event: tuple(cbs) for event, cbs in manager._hooks.items() if cbs})
 
 
+def _same_callbacks(first, second):
+    """True when two identity samples hold the same callbacks by object identity. Never ``==``: a plugin callable's
+    ``__eq__`` can run, and an unavailable sample (``False``) is not agreement."""
+    if not isinstance(first, dict) or not isinstance(second, dict) or first.keys() != second.keys():
+        return False
+    return all(len(first[event]) == len(second[event]) and all(a is b for a, b in zip(first[event], second[event]))
+               for event in first)
+
+
 def _registries(home_doc, source):
     """One sample of every live registry the projection reports: shell hooks (consent, parse), wired outbound
     webhooks, observers and the callback identities. Called twice per read; a difference between the samples is an
@@ -473,10 +485,12 @@ def _registries(home_doc, source):
 
 
 def _chain_key(entries, env, named):
-    """Ordered route identities of a fallback chain: provider, model, endpoint, api_mode and key presence. Compared in
-    memory before anything is returned, so an endpoint-only change is a different route."""
+    """Ordered route identities of a fallback chain: provider, model, endpoint, api_mode, key presence and whether each
+    entry declares a credential (presence only, never its value). Compared in memory before anything is returned, so an
+    endpoint-only or credential-declaration-only change is a different route."""
     return [json.dumps([_route(entry, entry.get('model'), env=env, named=named)[0], entry.get('base_url'),
-                        entry.get('api_mode')], sort_keys=True, default=str) for entry in entries]
+                        entry.get('api_mode'), [bool(entry.get(key)) for key in ('api_key', 'key_env', 'api_key_env')]],
+                       sort_keys=True, default=str) for entry in entries]
 
 
 def _chain_view(cfg, env, named):
@@ -533,7 +547,8 @@ def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, secrets
     fallback = _fallback(chain, env, named)
     fallback['chain_complete'] = fallback['chain_complete'] and chain_known
     first = _registries(home_doc, source)
-    stable = first == _registries(home_doc, source)
+    second = _registries(home_doc, source)
+    stable = first[:-1] == second[:-1] and _same_callbacks(first[-1], second[-1])
     events, hooks_complete, wired, observers, observers_complete, _ = first
     raw_hooks = source.get('hooks')
     raw_outbound = raw_hooks.get('outbound') if isinstance(raw_hooks, dict) else None
@@ -588,6 +603,14 @@ def _home_state(home):
     return (doc, True) if isinstance(doc, dict) else ({}, False)
 
 
+def _sources_unpublished(home, doc):
+    """True when the profile configures external secret sources this process never published. The getter binds
+    without hydration (it may not run a source), so such a profile's source-supplied endpoint or key is unknown."""
+    from hermes_cli import env_loader
+    from hermes_constants import hermes_home_key
+    return bool(doc.get('secrets')) and hermes_home_key(home) not in env_loader._APPLIED_HOMES
+
+
 def _managed_overlay_active():
     from hermes_cli.managed_scope import load_managed_config
     try:
@@ -631,10 +654,11 @@ async def runtime_policy(connection, ref, params, policy):
         from gateway.run import _profile_runtime_scope
         from gateway.session_policy import present_sections
         from hermes_cli.fallback_config import get_fallback_chain
-        with _profile_runtime_scope(home):
+        # Unhydrated: a getter never runs a configured secret source; it reads only the published snapshot.
+        with _profile_runtime_scope(home, hydrate_secrets=False):
             doc, home_ok = _home_state(home)
             env = _env_names(home / '.env')
-            home_ok = home_ok and env is not None
+            home_ok = home_ok and env is not None and not _sources_unpublished(home, doc)
             env = env or frozenset()
             live_ok = home_ok and not _managed_overlay_active()
             if policy is None:
