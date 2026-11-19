@@ -43,7 +43,7 @@ class ConfigGetResult(Result):
     """Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,
     ``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,
     ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``,
-    ``runtime_policy`` for the main-only route projection."""
+    ``runtime_policy`` for the native-owner route projection."""
 
     value: str | None = None
     runtime_policy: dict[str, JsonValue] | None = None

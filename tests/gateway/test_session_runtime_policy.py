@@ -1,4 +1,4 @@
-"""``config.get runtime_policy``: the main connection reads a non-secret effective route projection."""
+"""``config.get runtime_policy``: the native owner connection reads a non-secret effective route projection."""
 
 import asyncio
 import json
@@ -41,8 +41,10 @@ def test_api_key_primary_with_empty_fallback_is_complete(tmp_path):
 
         async def probe():
             async with websocket(home, desc) as ws:
-                policy = (await _read(ws))["result"]["runtime_policy"]
+                sid = (await rpc(ws, "session.create", request_id="policy", source="tui", toolsets=[]))["result"]["session_id"]
+                policy = (await _read(ws, session_id=sid))["result"]["runtime_policy"]
                 assert policy["complete"] is True, policy
+                assert (await _read(ws))["result"]["runtime_policy"]["complete"] is False
                 assert policy["primary"]["provider"] == "openrouter"
                 assert policy["primary"]["model"] == "primary-model"
                 assert policy["primary"]["credential_kind"] == "api_key"
@@ -197,7 +199,8 @@ def test_checkpoint_required_is_projected_and_unknown_is_incomplete(
 
         async def probe():
             async with websocket(home, desc) as ws:
-                policy = (await _read(ws))["result"]["runtime_policy"]
+                sid = (await rpc(ws, "session.create", request_id="policy", source="tui", toolsets=[]))["result"]["session_id"]
+                policy = (await _read(ws, session_id=sid))["result"]["runtime_policy"]
                 assert policy["compression"] == {"checkpoint_required": expected}, (
                     policy
                 )
@@ -207,7 +210,7 @@ def test_checkpoint_required_is_projected_and_unknown_is_incomplete(
 
 
 @pytest.mark.platforms("linux")
-def test_non_main_connection_is_refused(tmp_path):
+def test_non_native_owner_connection_is_refused(tmp_path):
     with owner(tmp_path, {"model": PRIMARY}) as (_, _, desc):
 
         async def probe():

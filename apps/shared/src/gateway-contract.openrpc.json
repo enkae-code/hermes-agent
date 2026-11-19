@@ -13161,7 +13161,7 @@
       },
       "ConfigGetResult": {
         "additionalProperties": false,
-        "description": "Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,\n``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,\n``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``,\n``runtime_policy`` for the main-only route projection.",
+        "description": "Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,\n``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,\n``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``,\n``runtime_policy`` for the native-owner route projection.",
         "properties": {
           "value": {
             "anyOf": [

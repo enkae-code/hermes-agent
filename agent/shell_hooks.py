@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, UTC
@@ -342,6 +343,13 @@ def consented_hook_state(cfg: Optional[dict[str, Any]]) -> tuple[list[str], bool
     with _registered_lock:
         events = sorted({key[1] for key in _registered if key[0] == home_key})
     return events, _parse_hooks(cfg.get("hooks") if isinstance(cfg, dict) else None)[1]
+
+
+def registered_event_counts() -> Counter:
+    """Per-event count of the shell hooks this home has wired: one dispatch callback each."""
+    home_key = _home_key()
+    with _registered_lock:
+        return Counter(key[1] for key in _registered if key[0] == home_key)
 
 
 def re_register_config_hooks() -> None:

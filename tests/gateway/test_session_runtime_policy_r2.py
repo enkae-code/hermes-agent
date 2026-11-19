@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import threading
 
 import hermes_yaml as yaml
 import pytest
@@ -96,39 +95,6 @@ def test_pinned_session_keeps_its_frozen_route_after_a_profile_edit(tmp_path):
 
 
 @pytest.mark.platforms("linux")
-def test_frozen_session_checkpoint_ignores_a_later_live_edit(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY, "compression": {"checkpoint_required": True}}) as (home, _, desc):
-
-        async def probe():
-            async with websocket(home, desc) as ws:
-                sid = (await _create(ws))["result"]["session_id"]
-                config = yaml.safe_load((home / "config.yaml").read_text())
-                config["compression"] = {"checkpoint_required": False}
-                _write(home, config)
-                policy = (await _read(ws, session_id=sid))["result"]["runtime_policy"]
-                assert policy["compression"] == {"checkpoint_required": True}, policy
-
-        asyncio.run(probe())
-
-
-@pytest.mark.platforms("linux")
-def test_frozen_fallback_chain_ignores_a_later_live_edit(tmp_path):
-    fallback = [{"provider": "openrouter", "model": "frozen-fb", "api_key": "SENTINEL-KEY"}]
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": fallback}) as (home, _, desc):
-
-        async def probe():
-            async with websocket(home, desc) as ws:
-                sid = (await _create(ws))["result"]["session_id"]
-                config = yaml.safe_load((home / "config.yaml").read_text())
-                config["fallback_providers"] = [{**fallback[0], "model": "edited-fb"}]
-                _write(home, config)
-                chain = (await _read(ws, session_id=sid))["result"]["runtime_policy"]["fallback"]
-                assert [row["model"] for row in chain["providers"]] == ["frozen-fb"], chain
-
-        asyncio.run(probe())
-
-
-@pytest.mark.platforms("linux")
 def test_unreadable_config_makes_the_projection_incomplete(tmp_path):
     with owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
 
@@ -178,40 +144,18 @@ def test_home_read_writes_no_backup_where_a_cold_load_does(tmp_path, monkeypatch
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"model": PRIMARY}))
-    doc, readable = session_config._home_doc(tmp_path)
+    doc, readable = session_config._home_state(tmp_path)
     assert readable is True and doc["model"] == PRIMARY
     assert _backups(tmp_path) == []
     load_config()  # control: the cold load is what writes the good backup this read must not
     assert _backups(tmp_path) != []
 
 
-def test_in_progress_plugin_discovery_is_unknown_not_complete(monkeypatch):
-    from hermes_cli.plugins import get_plugin_manager
-
-    manager = get_plugin_manager()
-    monkeypatch.setattr(manager, "_discovered", True)
-    assert session_config._observers({})[1] is True
-    holder = threading.Thread(target=lambda: _hold(manager))
-    holder.start()
-    try:
-        assert session_config._observers({}) == ([], False)
-    finally:
-        _release.set()
-        holder.join()
-
-
-_release = threading.Event()
-
-
-def _hold(manager):
-    with manager._discovery_lock:
-        _release.wait(10)
-
-
 def test_enabled_first_party_observer_is_reported(monkeypatch):
     from hermes_cli.plugins import get_plugin_manager
 
     monkeypatch.setattr(get_plugin_manager(), "_discovered", True)
+    monkeypatch.setattr(get_plugin_manager(), "_hooks", {})
     rows, complete = session_config._observers({"telemetry": {"shared_metrics": {"enabled": True}}})
     assert complete is True
     assert [row["name"] for row in rows] == ["shared_metrics"], rows

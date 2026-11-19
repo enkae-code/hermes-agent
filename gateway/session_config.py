@@ -1,5 +1,6 @@
 """Owner-bound native settings and model inventory, never legacy execution."""
 import asyncio
+from collections import Counter
 from functools import partial
 import hashlib
 import json
@@ -79,7 +80,7 @@ async def config_get(connection, ref, params):
     if key == 'voice':
         return _voice(connection, ref)
     if key == 'runtime_policy':
-        return await runtime_policy(connection, ref, params)
+        return await runtime_policy(connection, ref, params, policy)
     agent = connection.authority.agent(ref) if ref.session_id else None
 
     def read():
@@ -254,15 +255,16 @@ def _literal_key(value):
     return isinstance(value, str) and bool(value.strip()) and '$' not in value
 
 
-def _route(entry, model):
-    """``(identity, base_url)`` for one route. An api_key provider is ``api_key`` only when the route names
-    a literal key itself; an env-only or unresolved key reads ``unknown``. A provider outside the catalog is
-    not emitted. Nothing from the key, the URL path, query or headers is returned."""
+def _route(entry, model, key_present=False):
+    """``(identity, base_url)`` for one route. An api_key provider is ``api_key`` only when the route holds a
+    key: a literal one in its config, or ``key_present`` (the session's secret map or a bound launch key, by
+    presence only). An env-only or unresolved key reads ``unknown``. A provider outside the catalog is not
+    emitted. Nothing from the key, the URL path, query or headers is returned."""
     from hermes_cli.providers import get_provider
     provider = _ident(entry.get('provider'))
     pdef = get_provider(provider, allow_network=False) if provider else None
     kind = _CREDENTIAL_KINDS.get(pdef.auth_type) if pdef else None
-    if kind == 'api_key' and not _literal_key(entry.get('api_key')):
+    if kind == 'api_key' and not (key_present or _literal_key(entry.get('api_key'))):
         kind = None
     base = entry.get('base_url') or (pdef.base_url if pdef else '')
     identity = {'provider': provider if pdef else None, 'model': _ident(model), 'credential_kind': kind or 'unknown'}
@@ -298,23 +300,36 @@ def _checkpoint_required(cfg):
 
 
 def _observers(home_doc):
-    """``(rows, complete)``: the lifecycle observers that run, from the live registries. Never discovers,
-    waits or calls ``enabled()`` (which can tear a runtime down). Discovery in flight or not yet run is unknown."""
+    """``(rows, complete)``: the lifecycle observers that run, from the live dispatch registry. Never discovers,
+    waits or calls ``enabled()`` (which can tear a runtime down). A callback the registry holds that no plugin
+    row, shell hook or outbound webhook accounts for (a memory provider's fallback hook) is incomplete."""
     from agent.safe_worker_policy import safe_worker_enabled
     if safe_worker_enabled():
         return [], True
+    from agent.outbound_webhooks import registered_targets
+    from agent.shell_hooks import registered_event_counts
     from hermes_cli.observability.relay_shared_metrics import HANDLED_HOOKS
     from hermes_cli.plugins import _loaded_registry_nowait
-    rows = _loaded_registry_nowait(lambda m: [
-        {'name': p.manifest.name, 'events': sorted(p.hooks_registered)}
-        for p in m._plugins.values() if p.enabled and not p.error and p.hooks_registered])
-    if rows is False:
+
+    def dispatch(manager):
+        rows = [{'name': p.manifest.name, 'events': sorted(p.hooks_registered)}
+                for p in manager._plugins.values() if p.enabled and not p.error and p.hooks_registered]
+        # ponytail: one attributed callback per plugin row per event; a plugin registering twice reads incomplete.
+        attributed = Counter(event for row in rows for event in row['events'])
+        attributed.update(registered_event_counts())
+        attributed.update(event for event, _ in registered_targets())
+        dispatched = Counter({event: len(callbacks) for event, callbacks in manager._hooks.items() if callbacks})
+        return rows, dispatched == attributed
+
+    result = _loaded_registry_nowait(dispatch)
+    if result is False:
         return [], False
+    rows, accounted = result
     telemetry = home_doc.get('telemetry')
     shared = telemetry.get('shared_metrics') if isinstance(telemetry, dict) else None
     if isinstance(shared, dict) and shared.get('enabled') is True:
         rows.append({'name': 'shared_metrics', 'events': sorted(HANDLED_HOOKS)})
-    return rows, all(_ident(row['name']) == row['name'] for row in rows)
+    return rows, accounted and all(_ident(row['name']) == row['name'] for row in rows)
 
 
 def _revision(sections, complete):
@@ -324,28 +339,29 @@ def _revision(sections, complete):
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def _runtime_policy(home_doc, source, known):
-    """The projection of ``source``: the frozen snapshot for a session, else the home's own config read.
-    ``known`` is False when that route or the home config could not be read whole. Hooks, webhooks and
-    observers are the live registries; the YAML only validates them."""
-    from agent.outbound_webhooks import iter_configured_targets, registered_targets
+def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, secrets, bound, session, managed, known):
+    """The projection of one route. ``source`` is the route the session pins (or the home's config, sessionless);
+    ``chain`` and ``checkpoint`` are the sources execution reads them from. ``secrets``: the config paths whose
+    values the session holds out of its config; ``bound``: a launch key is bound. Hooks, webhooks and observers
+    come from the live registries; the YAML is never re-parsed here."""
+    from agent.outbound_webhooks import registered_targets
     from agent.shell_hooks import consented_hook_state
     model = source.get('model')
     route = model if isinstance(model, dict) else {}
     name = model if isinstance(model, str) else route.get('default') or route.get('model')
-    identity, base = _route(route, name)
+    identity, base = _route(route, name, ('model', 'api_key') in secrets or bound)
     primary = {**identity, 'endpoint_host': _host(base)}
-    fallback = _fallback(source)
+    fallback = _fallback(chain)
+    fallback['chain_complete'] = fallback['chain_complete'] and chain_known
     events, hooks_complete = consented_hook_state(source)
-    targets = iter_configured_targets(source)
-    raw_hooks = source.get('hooks')
-    raw_outbound = raw_hooks.get('outbound') if isinstance(raw_hooks, dict) else None
     wired = registered_targets()
     hosts = {_host(url) for _, url in wired}
-    webhooks_complete = '' not in hosts and (
-        raw_outbound is None or (isinstance(raw_outbound, list) and len(targets) == len(raw_outbound)))
+    raw_hooks = source.get('hooks')
+    raw_outbound = raw_hooks.get('outbound') if isinstance(raw_hooks, dict) else None
+    # ponytail: structural entry check, not the validating parser (which resolves secret_env); a wired target is in the registry.
+    webhooks_complete = '' not in hosts and (raw_outbound is None or (isinstance(raw_outbound, list) and all(
+        isinstance(entry, dict) and isinstance(entry.get('url'), str) and _host(entry['url']) for entry in raw_outbound)))
     observers, observers_complete = _observers(home_doc)
-    checkpoint = _checkpoint_required(source)
     sections = {
         'primary': primary,
         'fallback': fallback,
@@ -358,14 +374,17 @@ def _runtime_policy(home_doc, source, known):
     }
     primary_known = (all(primary[k] for k in ('provider', 'model', 'endpoint_host'))
                      and primary['credential_kind'] != 'unknown')
-    complete = (known and primary_known and fallback['chain_complete'] and hooks_complete and webhooks_complete
-                and observers_complete and checkpoint is not None)
+    complete = (session and not managed and known and primary_known and fallback['chain_complete']
+                and hooks_complete and webhooks_complete and observers_complete and checkpoint is not None)
     return {**sections, 'revision': _revision(sections, complete), 'complete': complete}
 
 
-def _home_doc(home):
-    """``(doc, readable)``: the profile's own config.yaml, read with no write, hydration or env expansion."""
-    from hermes_cli.config_backend import read_config_doc_readonly
+def _home_state(home):
+    """``(doc, readable)``: the profile's own config.yaml, read with no write, hydration or env expansion. A
+    remote config backend is not fetched here: its state is not published locally, so it is unreadable."""
+    from hermes_cli.config_backend import get_config_backend, read_config_doc_readonly
+    if not get_config_backend().honors_managed_config():
+        return {}, False
     try:
         doc = read_config_doc_readonly(home / 'config.yaml')
     except Exception:
@@ -383,24 +402,57 @@ def _managed_overlay_active():
         return True
 
 
-async def runtime_policy(connection, ref, params):
-    """Main-only (the native owner connection), read-only projection of the effective runtime route:
-    what a managed client checks before its first prompt. Non-secret by construction."""
+def _managed_worker(policy):
+    """True when the session executes in a managed worker, or whether it does cannot be told without starting one."""
+    from gateway import session_managed_worker
+    try:
+        return session_managed_worker.policy_if_managed(policy) is not None
+    except RuntimeStoreError:
+        return True
+
+
+def _secret_paths(authority, policy):
+    """The config paths whose secret values the session holds out of its config. Presence only: no value is read."""
+    from gateway.session_policy_credentials import PREFIX
+    ref = policy.config_secret_ref
+    if ref is None:
+        return set()
+    if ref.startswith(PREFIX):
+        return {tuple(path) for path, _ in json.loads(ref[len(PREFIX):])['entries']}
+    return set(getattr(authority, '_local_config_secrets', {}).get(ref) or ())
+
+
+async def runtime_policy(connection, ref, params, policy):
+    """Native-owner connection only, read-only projection of the effective runtime route: what a managed client
+    checks before its first prompt. A session reads what its execution reads: a pinned route from the frozen
+    snapshot, the fallback chain and checkpoint from the profile where execution re-reads them. Non-secret by
+    construction. A sessionless read is informational and never complete."""
     if not connection.native_owner:
         raise RuntimeStoreError('permission_denied')
-    policy = _authorize(connection, ref, params)
     home = Path(connection.authority.profile_id)
 
     def read():
         from gateway.session_policy import present_sections
-        doc, home_ok = _home_doc(home)
+        doc, home_ok = _home_state(home)
+        live_ok = home_ok and not _managed_overlay_active()
         if policy is None:
-            # The raw read applies no managed overlay: a managed layer leaves the route unknown.
-            return {'runtime_policy': _runtime_policy(doc, doc, home_ok and not _managed_overlay_active())}
-        # The session's route is its frozen snapshot. A following session also reads the live profile,
-        # which this read does not do (a cold read writes backups), so its route is not resolvable here.
+            return {'runtime_policy': _runtime_policy(
+                doc, doc, chain=doc, chain_known=live_ok, checkpoint=_checkpoint_required(doc) if live_ok else None,
+                secrets=set(), bound=False, session=False, managed=False, known=home_ok)}
         frozen = present_sections(json.loads(policy.config_json))
-        return {'runtime_policy': _runtime_policy(doc, frozen, home_ok and not policy.followed_sections)}
+        if policy.safe_mode:
+            chain, chain_known = {}, True
+        elif policy.ignore_user_config:
+            chain, chain_known = frozen, True
+        else:
+            chain, chain_known = doc, live_ok
+        checkpoint_known = policy.ignore_user_config or live_ok
+        checkpoint_source = frozen if policy.ignore_user_config else doc
+        return {'runtime_policy': _runtime_policy(
+            doc, frozen, chain=chain, chain_known=chain_known,
+            checkpoint=_checkpoint_required(checkpoint_source) if checkpoint_known else None,
+            secrets=_secret_paths(connection.authority, policy), bound=policy.credential_ref is not None,
+            session=True, managed=_managed_worker(policy), known=home_ok)}
     return await asyncio.to_thread(read)
 
 
