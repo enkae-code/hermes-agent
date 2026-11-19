@@ -30,6 +30,7 @@ def _create_pagestone(ws, cwd, **overrides):
         ignore_rules=True,
         accept_hooks=False,
         follow_profile_config=False,
+        editor={"mcp_servers": []},
     )
     return rpc(ws, "session.create", request_id="policy", **{**shape, **overrides})
 
