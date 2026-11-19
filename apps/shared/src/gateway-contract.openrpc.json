@@ -11754,6 +11754,18 @@
             "title": "Voice Turn",
             "type": "boolean"
           },
+          "expected_policy_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expected Policy Revision"
+          },
           "display_kind": {
             "anyOf": [
               {

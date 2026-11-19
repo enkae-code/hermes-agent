@@ -260,6 +260,8 @@ class CanonicalSubmitParams(CanonicalSessionParams):
     voice_context: str | None = None
     interrupted: bool = False
     voice_turn: bool = False
+    # Route lock: refuses the turn unless it equals the locked session's current ``runtime_policy.revision``.
+    expected_policy_revision: str | None = None
     # Desktop composer presentation, committed per admission (``display_v1``): a hidden widget
     # intent persists ``display_kind=hidden`` (never a user bubble); a large paste's preview is
     # titler input only, never model input.

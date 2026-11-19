@@ -644,6 +644,11 @@ async def admit_managed(authority, ref, row, policy):
         result = workspace_unavailable_result(policy)
         authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
         return result['final_response']
+    from gateway.session_route_lock import is_locked, unsupported_result
+    if is_locked(policy):  # a worker resolves its own route, so it cannot honour the lock
+        result = unsupported_result()
+        authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
+        return result['final_response']
     result = _unsupported_command_result(row)
     if result is not None:
         authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}

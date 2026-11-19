@@ -41,7 +41,7 @@ def _read(ws, **params):
 
 
 @pytest.mark.platforms("linux")
-def test_api_key_primary_with_empty_fallback_is_complete(tmp_path):
+def test_unlocked_session_is_never_complete_and_its_credential_kind_is_unknown(tmp_path):
     with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
         home,
         _,
@@ -61,14 +61,13 @@ def test_api_key_primary_with_empty_fallback_is_complete(tmp_path):
                     )
                 )["result"]["session_id"]
                 policy = (await _read(ws, session_id=sid))["result"]["runtime_policy"]
-                assert policy["complete"] is True, policy
+                assert policy["complete"] is False, policy  # only a route-locked session can be complete
                 assert (await _read(ws))["result"]["runtime_policy"][
                     "complete"
                 ] is False
                 assert policy["primary"]["provider"] == "openrouter"
                 assert policy["primary"]["model"] == "primary-model"
-                assert policy["primary"]["credential_kind"] == "api_key"
-                assert policy["primary"]["endpoint_host"]
+                assert policy["primary"]["credential_kind"] == "unknown"
                 assert policy["fallback"] == {
                     "providers": [],
                     "legacy_fallback_model": None,
@@ -112,7 +111,6 @@ def test_fallback_providers_and_legacy_fallback_model_are_both_reported(tmp_path
                     "listed-fallback",
                     "legacy-fallback",
                 ]
-                assert fallback_view["providers"][0]["credential_kind"] == "unknown"  # S5: a YAML key is not certified
                 assert fallback_view["legacy_fallback_model"] == "legacy-fallback"
                 assert fallback_view["chain_complete"] is False  # S7: any fallback chain is incomplete
 
@@ -233,7 +231,7 @@ def test_checkpoint_required_is_projected_and_unknown_is_incomplete(
                 assert policy["compression"] == {"checkpoint_required": expected}, (
                     policy
                 )
-                assert policy["complete"] is (expected is not None)
+                assert policy["complete"] is False  # unlocked: never complete, whatever the checkpoint reads
 
         asyncio.run(probe())
 

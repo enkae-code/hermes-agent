@@ -565,7 +565,7 @@ class AuthorityConnection:
                 'authority_epoch': self.authority.epoch,
                 'capabilities': ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', 'acp-editor-policy-v1',
                                  'acp-session-mcp-v1', 'clarify-batch-v1', 'plugin-rpc-v1', 'session-client-v1', 'session-transcript-v1', 'session-list-picker-v1',
-                                 'session-list-cursor-v1', 'runtime-policy-v1'],
+                                 'session-list-cursor-v1', 'runtime-policy-v1', 'route-lock-v1'],
                 'session_create': {'sources': sorted(SURFACES),
                                    'parameters': sorted(CREATE_FIELDS | {'title'})},
                 # Main's ``gateway.ready.skin``: the canonical client's own ready carries it.
@@ -806,6 +806,7 @@ class AuthorityConnection:
             self._record_voice_stop(ref, params)
             return {'voice_stopped': True}
         # The interactive WS is the one surface a restart's after-turn wait admits (#139041).
+        await self._policy_fence(ref, params)
         receipt = await self.authority.submit(self.actor, self.submission(ref, params),
                                               queue_while_restarting=self._operator is True)
         return asdict(receipt)
@@ -861,13 +862,30 @@ class AuthorityConnection:
         from tui_gateway import server
         return await asyncio.to_thread(server._consume_typed_stop_phrase, text, ref.session_id, emit=False)
 
+    async def _policy_fence(self, ref, params):
+        """``expected_policy_revision`` on a locked session: refused unless it is the revision ``runtime_policy``
+        reports now. An unlocked session ignores it (its revision never claims completeness)."""
+        expected = params.get('expected_policy_revision')
+        if expected is None:
+            return
+        from gateway.session_policy import policy_for_source
+        from gateway.session_route_lock import is_locked, refusal
+        policy = policy_for_source(self.authority.runner, self.authority.sessions[ref.session_id].source)
+        if not is_locked(policy):
+            return
+        from gateway.session_config import projected_runtime_policy
+        current = (await projected_runtime_policy(self, ref, policy))['runtime_policy']['revision']
+        if expected != current:
+            raise refusal('expected_policy_revision is not the current runtime_policy.revision')
+
     def submission(self, ref, params):
         """The admission a ``prompt.submit``-shaped request asks for (``prompt.replace_queued`` too)."""
         if ref.session_id not in self.subscriptions:
             raise RuntimeStoreError('permission_denied')
         forbidden = set(params) - {'session_id', 'text', 'submission_id', 'input_id', 'queued', 'attachments', 'finite', 'unattended',
                                    'surface', 'voice_context', 'interrupted', 'voice_turn', 'display_kind', 'title_preview',
-                                   'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+                                   'turn_author', 'api_text', 'model_override', 'clarify_batch',
+                                   'expected_policy_revision'}
         if forbidden:
             raise RuntimeStoreError('invalid_params')
         request_id = params.get('submission_id') or params.get('input_id')

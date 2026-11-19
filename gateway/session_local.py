@@ -275,14 +275,22 @@ def staged_creation_follows(authority, actor, request_id):
 
 def _refuse_unless_static_key(authority, policy):
     """Route lock (``fallback: "none"``): resolve the primary route the way execution does, fallback off,
-    and refuse unless the resolver selected a static API key. Runs before the creation commit."""
+    refuse unless the resolver selected a static API key, else return the frozen route for the policy's
+    ``route_lock_json``. Runs before the creation commit."""
     from gateway.session_policy import route_launch_key
     from gateway.session_worker_construct import route_runtime
+    from hermes_cli.auth import AuthError
     frozen, model = policy.effective(authority)
-    runtime, _ = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen), fallback=False)
+    try:
+        runtime, _ = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen), fallback=False)
+    except (AuthError, ValueError) as exc:
+        raise RuntimeStoreError('invalid_params', field='fallback',
+                                detail='the primary route could not be resolved') from exc
     if runtime.get('credential_kind') != 'api_key':
         raise RuntimeStoreError('invalid_params', field='fallback',
                                 detail='the primary credential is not a static API key')
+    from gateway.session_route_lock import freeze
+    return freeze(runtime, model)
 
 
 def stage_local_session(authority, actor, params, *, trusted_policy=None, trusted_secrets=None, skills_prompt=None,
@@ -376,7 +384,7 @@ def stage_local_session(authority, actor, params, *, trusted_policy=None, truste
                              owner_key=client_key is None,  # an overlapping exact retry takes the held one
                              client_request=client_request)
     if json.loads(policy.request_json).get('fallback') == 'none':
-        _refuse_unless_static_key(authority, policy)
+        policy = replace(policy, route_lock_json=_refuse_unless_static_key(authority, policy))
     from gateway.session_local_recovery import local_source
     source = local_source(authority, sid, actor.subject)
     route = authority.runner.session_store._generate_session_key(source)

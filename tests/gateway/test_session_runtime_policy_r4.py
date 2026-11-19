@@ -94,28 +94,6 @@ def test_live_edit_disagreeing_with_frozen_fallback_is_incomplete(tmp_path):
         asyncio.run(probe())
 
 
-def test_named_provider_is_incomplete_and_unknown(tmp_path):
-    named = {
-        "providers": {
-            "mine": {
-                "base_url": "https://named.example.test/v1",
-                "api_key": "SENTINEL-KEY",
-            }
-        }
-    }
-    with policy_owner(tmp_path, {"model": PRIMARY, "fallback_providers": [], **named}) as (
-        home,
-        _,
-        desc,
-    ):
-        raw, _ = _policy_for(home, desc)
-        policy = json.loads(raw)["result"]["runtime_policy"]
-        assert policy["complete"] is False, policy
-        assert policy["primary"]["credential_kind"] == "unknown", policy
-        assert policy["primary"]["endpoint_host"] == "", policy
-        assert "SENTINEL-KEY" not in raw and "named.example.test" not in raw
-
-
 CATALOG = {
     "openrouter": {
         "name": "OpenRouter",
@@ -141,52 +119,6 @@ def _seed_catalog(monkeypatch):
     )
 
 
-def test_env_key_without_a_declared_catalog_is_unknown(tmp_path):
-    with policy_owner(tmp_path, {"model": {"provider": "anthropic", "default": "primary-model"}, "fallback_providers": []}) as (
-        home,
-        _,
-        desc,
-    ):
-        (home / ".env").write_text("OPENROUTER_API_KEY=SENTINEL-ENV-KEY\n")
-        raw, _ = _policy_for(home, desc)
-        policy = json.loads(raw)["result"]["runtime_policy"]
-        assert policy["primary"]["credential_kind"] == "unknown", policy
-        assert policy["complete"] is False, policy
-        assert "SENTINEL-ENV-KEY" not in raw
-
-
-def test_profile_env_key_is_api_key_by_presence_only(tmp_path, monkeypatch):
-    _seed_catalog(monkeypatch)
-    with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
-        home,
-        _,
-        desc,
-    ):
-        (home / ".env").write_text("OPENROUTER_API_KEY=SENTINEL-ENV-KEY\n")
-        raw, _ = _policy_for(home, desc)
-        policy = json.loads(raw)["result"]["runtime_policy"]
-        assert policy["complete"] is True, policy
-        assert policy["primary"]["credential_kind"] == "api_key", policy
-        assert policy["primary"]["endpoint_host"] == "openrouter.ai", policy
-        assert "SENTINEL-ENV-KEY" not in raw
-
-
-def test_env_endpoint_override_makes_host_unknown(tmp_path):
-    with policy_owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
-        home,
-        _,
-        desc,
-    ):
-        (home / ".env").write_text(
-            "OPENROUTER_BASE_URL=https://override.example.test/v1\n"
-        )
-        raw, _ = _policy_for(home, desc)
-        policy = json.loads(raw)["result"]["runtime_policy"]
-        assert policy["primary"]["endpoint_host"] == "", policy
-        assert policy["complete"] is False, policy
-        assert "override.example.test" not in raw
-
-
 def test_registry_change_between_samples_is_incomplete(monkeypatch):
     import agent.outbound_webhooks as outbound
 
@@ -200,8 +132,7 @@ def test_registry_change_between_samples_is_incomplete(monkeypatch):
         chain=doc,
         chain_known=True,
         checkpoint=False,
-        secrets=set(),
-        bound=False,
+        locked=None,
         session=True,
         managed=False,
         known=True,
@@ -233,8 +164,7 @@ def test_shell_hook_inventory_is_quiet(caplog):
             chain=doc,
             chain_known=True,
             checkpoint=False,
-            secrets=set(),
-            bound=False,
+        locked=None,
             session=True,
             managed=False,
             known=True,
@@ -269,12 +199,12 @@ def test_retained_chain_that_disagrees_is_detected(tmp_path, monkeypatch):
     monkeypatch.setitem(
         hermes_config._LAST_EXPANDED_CONFIG_BY_PATH, str(home / "config.yaml"), retained
     )
-    assert session_config._retained_disagrees(home, doc, frozenset(), False) is True
+    assert session_config._retained_disagrees(home, doc) is True
     assert (
-        session_config._retained_disagrees(home, retained, frozenset(), False) is False
+        session_config._retained_disagrees(home, retained) is False
     )
     assert (
-        session_config._retained_disagrees(tmp_path / "other", doc, frozenset(), False)
+        session_config._retained_disagrees(tmp_path / "other", doc)
         is False
     )
 

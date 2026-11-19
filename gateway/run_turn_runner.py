@@ -182,6 +182,10 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
         # The chosen model is configured; its local server is down. Not a credential verdict, so
         # the client must not offer "Update API key" or sign-in: the sentence names the fix.
         return f"⚠️ {exc}", exc.error_code, exc.retryable
+    if isinstance(exc, RuntimeStoreError) and exc.reason == 'route_lock_mismatch':
+        return ("⚠️ This session is locked to the route it was created on, and that route is not what resolved for "
+                "this message, so nothing was sent. Start a new session to lock a new route. "
+                "(route_lock_mismatch)"), 'route_lock_mismatch', False
     if isinstance(exc, RuntimeStoreError) and exc.reason == 'launch_credentials_unavailable':
         # The session's launch key is gone (a restart revoked a CLI --api-key, a route key changed):
         # the shared refusal copy names /new, never a resend.

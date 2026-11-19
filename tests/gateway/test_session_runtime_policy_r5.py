@@ -42,89 +42,6 @@ def _no_pool(monkeypatch):
     monkeypatch.setattr(auth, "read_credential_pool", lambda provider=None: [])
 
 
-@pytest.mark.platforms("linux")
-def test_subscription_token_in_env_is_not_api_key(tmp_path):
-    with policy_owner(tmp_path, {"model": ANTHROPIC, "fallback_providers": []}) as (
-        home,
-        _,
-        desc,
-    ):
-        (home / ".env").write_text("CLAUDE_CODE_OAUTH_TOKEN=SENTINEL-OAT\n")
-        raw, _ = _policy_for(home, desc)
-        policy = _policy(raw)
-        assert policy["primary"]["credential_kind"] == "unknown", policy
-        assert policy["complete"] is False, policy
-        assert "SENTINEL-OAT" not in raw
-
-
-@pytest.mark.platforms("linux")
-def test_anthropic_api_key_env_alone_is_unknown(tmp_path):
-    with policy_owner(tmp_path, {"model": ANTHROPIC, "fallback_providers": []}) as (
-        home,
-        _,
-        desc,
-    ):
-        (home / ".env").write_text("ANTHROPIC_API_KEY=SENTINEL-ENV-KEY\n")
-        raw, _ = _policy_for(home, desc)
-        policy = _policy(raw)
-        assert policy["primary"]["credential_kind"] == "unknown", policy
-        assert policy["complete"] is False, policy
-        assert "SENTINEL-ENV-KEY" not in raw
-
-
-@pytest.mark.platforms("linux")
-def test_azure_entra_route_with_literal_key_is_unknown(tmp_path):
-    with policy_owner(tmp_path, {"model": AZURE, "fallback_providers": []}) as (home, _, desc):
-        raw, _ = _policy_for(home, desc)
-        policy = _policy(raw)
-        assert policy["primary"]["credential_kind"] == "unknown", policy
-        assert policy["complete"] is False, policy
-        assert "SENTINEL-KEY" not in raw
-
-
-@pytest.mark.platforms("linux")
-def test_key_reassigned_empty_in_env_is_not_api_key(tmp_path, monkeypatch):
-    _seed_catalog(monkeypatch)
-    with policy_owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
-        home,
-        _,
-        desc,
-    ):
-        (home / ".env").write_text(
-            "OPENROUTER_API_KEY=SENTINEL-ENV-KEY\nOPENROUTER_API_KEY=\n"
-        )
-        raw, _ = _policy_for(home, desc)
-        policy = _policy(raw)
-        assert policy["primary"]["credential_kind"] == "unknown", policy
-        assert policy["complete"] is False, policy
-
-
-def test_unreadable_env_is_unknown_not_absent(tmp_path):
-    assert session_config._env_names(tmp_path / ".env") == frozenset()
-    (tmp_path / "unreadable").mkdir()
-    assert session_config._env_names(tmp_path / "unreadable") is None
-
-
-def test_non_api_key_pool_row_makes_static_key_route_unknown(monkeypatch):
-    # Unit: the daemon regenerates its pool from the .env key at session start, so the row is injected here.
-    from hermes_cli import auth
-
-    entry = {"provider": "openrouter", "model": "m"}  # the .env key is the certified source, not a YAML key
-    env = frozenset({"OPENROUTER_API_KEY"})
-    monkeypatch.setattr(
-        auth,
-        "read_credential_pool",
-        lambda provider=None: [{"auth_type": "oauth", "source": "hermes_pkce"}],
-    )
-    assert session_config._route(entry, "m", env=env)[0]["credential_kind"] == "unknown"
-    monkeypatch.setattr(
-        auth,
-        "read_credential_pool",
-        lambda provider=None: [{"auth_type": "api_key", "source": "env:X"}],
-    )
-    assert session_config._route(entry, "m", env=env)[0]["credential_kind"] == "api_key"
-
-
 def _entry(model, base="https://fb.example.test/v1"):
     return {
         "provider": "openrouter",
@@ -142,9 +59,9 @@ def test_runner_retained_chain_must_agree_with_live_chain(tmp_path, monkeypatch)
     )
     agree = session_config._runner_chains_agree
     # Simulated effective-config read failure: the live chain is empty while execution retains one fallback.
-    assert agree(runner, tmp_path, [], frozenset(), False) is False
-    assert agree(runner, tmp_path, [_entry("old")], frozenset(), False) is True
-    assert agree(None, tmp_path, [], frozenset(), False) is False
+    assert agree(runner, tmp_path, []) is False
+    assert agree(runner, tmp_path, [_entry("old")]) is True
+    assert agree(None, tmp_path, []) is False
 
 
 def test_endpoint_only_fallback_change_is_route_disagreement(tmp_path, monkeypatch):
@@ -156,9 +73,9 @@ def test_endpoint_only_fallback_change_is_route_disagreement(tmp_path, monkeypat
     )
     agree = session_config._runner_chains_agree
     # The unchanged state agrees (the runner-wide slot equals live), so only the endpoint can differ below.
-    assert agree(runner, tmp_path, [_entry("same")], frozenset(), False) is True
+    assert agree(runner, tmp_path, [_entry("same")]) is True
     moved = [_entry("same", base="https://moved.example.test/v1")]
-    assert agree(runner, tmp_path, moved, frozenset(), False) is False
+    assert agree(runner, tmp_path, moved) is False
 
 
 def _samples(monkeypatch, first, second):
@@ -168,20 +85,23 @@ def _samples(monkeypatch, first, second):
     monkeypatch.setattr(session_config, "_hook_identity", lambda: next(states))
     monkeypatch.setattr(outbound, "registered_targets", list)
     monkeypatch.setattr(session_config, "_observers", lambda home_doc: ([], True))
+    from gateway import session_route_lock
+
     _no_pool(monkeypatch)
     doc = {"model": CERTIFIED}
+    frozen = {"provider": "openrouter", "base_url": "https://openrouter.ai/api/v1", "api_mode": "chat_completions",
+              "credential_kind": "api_key", "api_key": "SENTINEL-KEY"}
+    locked = SimpleNamespace(route_lock_json=session_route_lock.freeze(frozen, "primary-model"))
     return session_config._runtime_policy(
         doc,
         doc,
         chain=doc,
         chain_known=True,
         checkpoint=False,
-        secrets=set(),
-        bound=False,
+        locked=locked,
         session=True,
         managed=False,
         known=True,
-        env=frozenset({"OPENROUTER_API_KEY"}),
     )
 
 
@@ -229,7 +149,7 @@ def test_invalid_observer_label_is_replaced_and_incomplete(monkeypatch):
 
 
 @pytest.mark.platforms("linux")
-def test_pagestone_shape_declares_editor_mcp_and_stays_complete(tmp_path, monkeypatch):
+def test_pagestone_shape_declares_editor_mcp_and_reports_incomplete_unlocked(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
     with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
         home,
@@ -245,4 +165,4 @@ def test_pagestone_shape_declares_editor_mcp_and_stays_complete(tmp_path, monkey
                 return json.dumps(await _read(ws, session_id=sid))
 
         policy = _policy(asyncio.run(probe()))
-        assert policy["complete"] is True, policy
+        assert policy["complete"] is False, policy  # unlocked; the editor MCP declaration is still reported

@@ -50,13 +50,24 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, record_notic
     from gateway.run import _runtime_agent_kwargs
     from gateway.session_policy import route_launch_key
     from gateway.session_worker_construct import route_runtime
+    from hermes_cli.auth import AuthError
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
     # A follow_profile_config session's route is the profile's current one, model and endpoint from one read.
     frozen, model = policy.effective(authority)
     provider = (frozen.get('model') or {}).get('provider')
-    runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
-                                            fallback=fallback)
+    from gateway import session_route_lock
+    locked = session_route_lock.is_locked(policy)
+    try:
+        runtime, fallback_entry = route_runtime(policy, frozen, model, route_launch_key(authority, policy, frozen),
+                                                fallback=fallback and not locked)
+    except (AuthError, ValueError) as exc:
+        if not locked:
+            raise
+        raise session_route_lock.refusal('the locked route could not be resolved') from exc
+    if locked:  # a locked session runs exactly its frozen route: the same one, no fallback, no pool rotation
+        session_route_lock.verify(policy, runtime, model)
+        runtime = {**runtime, 'credential_pool': None}
     if fallback_entry is not None:
         from hermes_cli.fallback_config import pre_agent_fallback_notice
         from agent.primary_auth_fallback import RUNTIME_KEY, set_pending_primary_auth_failure

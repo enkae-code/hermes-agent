@@ -61,6 +61,7 @@ def policy_identity(policy, unhashed=()):
     data = asdict(policy)
     data.pop('credential_ref')
     data.pop('config_secret_ref')
+    data.pop('route_lock_json')  # set after the reference is stamped; never part of a credential's binding
     # Fields added after release are hashed only when set, so an older session's reference still matches.
     if data.get('editor_mcp_json') is None:
         data.pop('editor_mcp_json', None)

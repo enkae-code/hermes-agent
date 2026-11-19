@@ -87,7 +87,7 @@ def test_ordinary_session_checkpoint_follows_a_live_edit(tmp_path):
 
 
 @pytest.mark.platforms("linux")
-def test_pagestone_shaped_session_is_complete(tmp_path):
+def test_pagestone_shaped_unlocked_session_reports_the_rest_but_is_not_complete(tmp_path):
     with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
         home,
         _,
@@ -102,8 +102,8 @@ def test_pagestone_shaped_session_is_complete(tmp_path):
                 ]
                 raw = json.dumps(await _read(ws, session_id=sid))
                 policy = json.loads(raw)["result"]["runtime_policy"]
-                assert policy["complete"] is True, policy
-                assert policy["primary"]["credential_kind"] == "api_key", policy
+                assert policy["complete"] is False, policy  # no fallback: "none" at create, so no lock
+                assert policy["primary"]["credential_kind"] == "unknown", policy
                 assert (
                     json.loads(raw)["result"]["runtime_policy"]["observer_plugins"]
                     == []
@@ -187,8 +187,7 @@ def test_webhook_secret_env_is_never_resolved_or_logged(monkeypatch, caplog):
             chain=doc,
             chain_known=True,
             checkpoint=False,
-            secrets=set(),
-            bound=False,
+        locked=None,
             session=False,
             managed=False,
             known=True,

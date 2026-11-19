@@ -19,6 +19,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.session_api_turn import api_runtime_locked
+from gateway.session_route_lock import is_locked
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -183,7 +184,7 @@ class GatewaySessionAgentMixin:
             session_db=getattr(runner._session_db, "_db", runner._session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
-            fallback_model=None if api_runtime_locked() else self._runner._refresh_fallback_model(),
+            fallback_model=None if api_runtime_locked() or is_locked(policy) else self._runner._refresh_fallback_model(),
             skip_context_files=bool(skip_context_files) or is_bot,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=not bool(policy and policy.ignore_rules),
@@ -219,7 +220,8 @@ class GatewaySessionAgentMixin:
         # Lock released — refresh the reused agent's fallback chain from disk OUTSIDE the cache lock
         # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
         # configured after caching must reach the next turn; per-session serialization keeps it safe.
-        locked = api_runtime_locked() is not None
+        from gateway.session_policy import policy_for_source
+        locked = api_runtime_locked() is not None or is_locked(policy_for_source(runner, ctx.source))
         if found.reused and agent is not None and locked and getattr(agent, "_fallback_activated", False):
             # A cached agent already moved onto a fallback provider cannot serve a confirmed lock.
             found.evicted, found.reused, agent = agent, False, None

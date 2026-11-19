@@ -5,7 +5,6 @@ from functools import partial
 import hashlib
 import json
 import logging
-import os
 import re
 import threading
 from pathlib import Path
@@ -229,16 +228,6 @@ def _project(params, policy, cfg):
     return {'cwd': cwd, 'branch': git_probe.branch(cwd)}
 
 
-# Certified shape (round 7, binding). complete=true only when every rule holds; any other profile is unknown and
-# incomplete, without modelling it. S1 provider is exactly 'openrouter' or 'deepseek' (no alias, no normalization,
-# no catalog lookup for any other name). S2 model.api_mode absent or 'chat_completions'. S3 model.base_url absent or
-# the catalog base_url after rstrip('/'). S4 no OPENROUTER/DEEPSEEK/CUSTOM/OPENAI_BASE_URL in any scope (presence).
-# S5 the key is the profile .env's declared variable, the only source certified; a YAML key, a key_env pointer, a
-# launch key, numbered or extra env keys, or a non-api_key or foreign pool row is unknown. S6 a secrets block or a
-# non-file config backend is unknown, decided before any scope. S7 any fallback chain is incomplete.
-_STATIC_KEY_PROVIDERS = {'openrouter': 'OPENROUTER_API_KEY', 'deepseek': 'DEEPSEEK_API_KEY'}
-_ENDPOINT_OVERRIDES = ('OPENROUTER_BASE_URL', 'DEEPSEEK_BASE_URL', 'CUSTOM_BASE_URL', 'OPENAI_BASE_URL')
-_YAML_KEY_FIELDS = ('api_key', 'api', 'key_env', 'api_key_env')
 # Public identifiers only. Config values can carry expanded secrets, so a value is emitted only when it is a
 # short token of this grammar; containers, ``${VAR}`` refs and free text are never stringified into a field.
 _IDENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}')
@@ -261,68 +250,19 @@ def _host(url):
     return host if host and _HOST.fullmatch(host) else ''
 
 
-def _override_present(var, env):
-    """True when an endpoint override is set in any scope execution may read: the routed (non-hydrating) scope,
-    the process environment or the profile .env. Presence only."""
-    from agent.secret_scope import get_secret_str
-    return var in env or bool(os.environ.get(var, '').strip()) or bool(get_secret_str(var, '').strip())
-
-
-def _canonical(provider):
-    """``(base_url, key variable)`` of an allowlisted provider, from the code's own registry and constant, never the
-    catalog (its openrouter entry declares neither)."""
-    from hermes_cli.auth import PROVIDER_REGISTRY
-    from hermes_constants import OPENROUTER_BASE_URL
-    base = PROVIDER_REGISTRY[provider].inference_base_url if provider in PROVIDER_REGISTRY else OPENROUTER_BASE_URL
-    return base.rstrip('/'), _STATIC_KEY_PROVIDERS[provider]
-
-
-def _certified_base(entry, canonical, env):
-    """``canonical`` when S2-S4 hold for this route, else ''."""
-    url = entry.get('base_url')
-    if entry.get('api_mode') not in (None, 'chat_completions'):
-        return ''
-    if url is not None and not (isinstance(url, str) and url.rstrip('/') == canonical):
-        return ''
-    if any(_override_present(var, env) for var in _ENDPOINT_OVERRIDES):
-        return ''
-    return canonical
-
-
-def _certified_key(provider, entry, var, canonical, key_present, env):
-    """S5: the profile .env's declared key variable is the one credential source; every other source is unknown."""
-    from hermes_cli.auth import _IMPLICIT_ENV_VARS, read_credential_pool
-    if key_present or var not in env or var in _IMPLICIT_ENV_VARS or any(entry.get(f) for f in _YAML_KEY_FIELDS):
-        return False
-    if any(name.startswith(var + '_') for name in {*env, *os.environ}):  # numbered or extra env pool keys
-        return False
-    try:
-        rows = read_credential_pool(provider)
-    except Exception:  # health: allow BLE001 -- fail closed: an unreadable pool may hold another credential
-        return False
-    return all(isinstance(row, dict) and row.get('auth_type') == 'api_key'
-               and (not row.get('base_url') or str(row['base_url']).rstrip('/') == canonical) for row in rows)
-
-
-def _route(entry, model, key_present=False, env=frozenset(), named=False):
-    """``(identity, base_url)`` for one route. Only an allowlisted name is resolved (no alias, no catalog lookup for any
-    other name); any other route, and any route through a ``providers:`` / ``secrets:`` entry (``named``), reads
-    credential kind unknown and an empty host. Nothing from the key, URL path, query or headers is returned."""
-    raw = entry.get('provider')
-    kind, base = 'unknown', ''
-    if not named and isinstance(raw, str) and raw in _STATIC_KEY_PROVIDERS:
-        canonical, var = _canonical(raw)
-        if _certified_key(raw, entry, var, canonical, key_present, env):
-            kind, base = 'api_key', _certified_base(entry, canonical, env)
-    return {'provider': _ident(raw), 'model': _ident(model), 'credential_kind': kind}, base
-
-
-def _primary(source, *, present=False, env=frozenset(), named=False):
+def _primary(source, locked_policy):
+    """The primary route a client is shown. A locked session reports its frozen route (read from the policy alone);
+    anything else is an unverified claim of the config, never a credential kind."""
+    if locked_policy is not None:
+        from gateway.session_route_lock import preview
+        provider, model, base_url = preview(locked_policy)
+        return {'provider': _ident(provider), 'model': _ident(model), 'credential_kind': 'api_key',
+                'endpoint_host': _host(base_url)}
     model = source.get('model')
     route = model if isinstance(model, dict) else {}
     name = model if isinstance(model, str) else route.get('default') or route.get('model')
-    identity, base = _route(route, name, present, env, named)
-    return {**identity, 'endpoint_host': _host(base)}
+    return {'provider': _ident(route.get('provider')), 'model': _ident(name), 'credential_kind': 'unknown',
+            'endpoint_host': ''}
 
 
 def _named(*docs):
@@ -331,15 +271,19 @@ def _named(*docs):
     return any(bool(doc.get(key)) for doc in docs for key in ('providers', 'custom_providers', 'secrets'))
 
 
-def _fallback(source, env=frozenset(), named=False):
+def _fallback(source):
     """The chain as execution reads it. S7: any entry or legacy ``fallback_model`` leaves the chain incomplete."""
     from hermes_cli.fallback_config import get_fallback_chain
     entries = get_fallback_chain(source)
-    providers = [_route(entry, entry.get('model'), env=env, named=named)[0] for entry in entries]
+    providers = [_entry_identity(entry) for entry in entries]
     legacy_raw = source.get('fallback_model')
     legacy = _ident(legacy_raw.get('model')) if isinstance(legacy_raw, dict) else None
     complete = not entries and not any(source.get(key) for key in ('fallback_providers', 'fallback_model'))
     return {'providers': providers, 'legacy_fallback_model': legacy, 'chain_complete': complete}
+
+
+def _entry_identity(entry):
+    return {'provider': _ident(entry.get('provider')), 'model': _ident(entry.get('model'))}
 
 
 def _checkpoint_required(cfg):
@@ -451,24 +395,24 @@ def _registries(home_doc, source):
     return events, hooks_complete, registered_targets(), observers, observers_complete, _hook_identity()
 
 
-def _chain_key(entries, env, named):
+def _chain_key(entries):
     """Ordered route identities of a fallback chain: provider, model, endpoint, api_mode, key presence and whether each
     entry declares a credential (presence only, never its value). Compared in memory before anything is returned, so an
     endpoint-only or credential-declaration-only change is a different route."""
-    return [json.dumps([_route(entry, entry.get('model'), env=env, named=named)[0], entry.get('base_url'),
+    return [json.dumps([_entry_identity(entry), entry.get('base_url'),
                         entry.get('api_mode'), [bool(entry.get(key)) for key in ('api_key', 'key_env', 'api_key_env')]],
                        sort_keys=True, default=str) for entry in entries]
 
 
-def _chain_view(cfg, env, named):
+def _chain_view(cfg):
     """What execution reads from a config for the fallback chain and checkpoint: the agreement key."""
     from hermes_cli.fallback_config import get_fallback_chain
-    fallback = _fallback(cfg, env, named)
-    return (_chain_key(get_fallback_chain(cfg), env, named), fallback['legacy_fallback_model'],
+    fallback = _fallback(cfg)
+    return (_chain_key(get_fallback_chain(cfg)), fallback['legacy_fallback_model'],
             fallback['chain_complete'], _checkpoint_required(cfg))
 
 
-def _runner_chains_agree(runner, home, entries, env, named):
+def _runner_chains_agree(runner, home, entries):
     """True when the runner's retained fallback state for this home (``_fallback_model_by_home``, keyed as the loader in
     ``gateway/run_config_loaders.py`` keys it) and its ``_fallback_model`` default both match the live chain. Read-only,
     compared in memory. An unreachable runner is not agreement."""
@@ -476,10 +420,10 @@ def _runner_chains_agree(runner, home, entries, env, named):
     by_home = getattr(runner, '_fallback_model_by_home', None) or {}
     if not isinstance(by_home, dict) or not hasattr(runner, '_fallback_model'):
         return False
-    live = _chain_key(entries, env, named)
+    live = _chain_key(entries)
     # A home the loader never refreshed has no retained chain of its own; the runner's default still must agree.
     retained = [by_home[hermes_home_key(home)]] if hermes_home_key(home) in by_home else []
-    return all(_chain_key(chain or [], env, named) == live for chain in [*retained, runner._fallback_model])
+    return all(_chain_key(chain or []) == live for chain in [*retained, runner._fallback_model])
 
 
 def _resident_fallback_active(agent):
@@ -487,31 +431,25 @@ def _resident_fallback_active(agent):
     return getattr(agent, '_fallback_activated', False) is True
 
 
-def _retained_disagrees(home, doc, env, named):
+def _retained_disagrees(home, doc):
     """True when the config this process last loaded for the home holds a different chain or checkpoint than the
     file now: a retained last-known-good an execution could still read. Read from the loader's cache, never mutated."""
     from hermes_cli.config import _LAST_EXPANDED_CONFIG_BY_PATH
     retained = _LAST_EXPANDED_CONFIG_BY_PATH.get(str(home / 'config.yaml'))
-    return retained is not None and _chain_view(retained, env, named) != _chain_view(doc, env, named)
+    return retained is not None and _chain_view(retained) != _chain_view(doc)
 
 
-def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, secrets, bound, session, managed, known,
-                    followed=False, live=None, env=frozenset(), named=False):
+def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, locked, session, managed, known,
+                    followed=False, live=None):
     """The projection of one route. ``source`` is the route the session pins (or the home's config, sessionless);
     ``live`` is the profile's current config, which every execution path may also read: a disagreement between
-    the two (primary, chain, checkpoint) is incomplete, and the live primary is reported. ``chain`` and
-    ``checkpoint`` are the sources execution reads them from. ``secrets``: the config paths whose values the
-    session holds out of its config; ``bound``: a launch key is bound. Hooks, webhooks and observers come from
-    the live registries, sampled twice: a difference between samples is incomplete. The YAML is never re-parsed."""
-    present = ('model', 'api_key') in secrets or bound
-    primary = _primary(source, present=present, env=env, named=named)
-    agreed = True
-    if live is not None:
-        live_primary = _primary(live, env=env, named=named)
-        agreed = (primary == live_primary and _chain_view(source, env, named) == _chain_view(live, env, named)
-                  and _checkpoint_required(source) == _checkpoint_required(live))
-        primary = live_primary
-    fallback = _fallback(chain, env, named)
+    the two (chain, checkpoint) is incomplete. ``locked``: the session's policy when it holds a route lock, whose
+    frozen route is the only primary reported complete. Hooks, webhooks and observers come from the live
+    registries, sampled twice: a difference between samples is incomplete. The YAML is never re-parsed."""
+    agreed = live is None or (_chain_view(source) == _chain_view(live)
+                              and _checkpoint_required(source) == _checkpoint_required(live))
+    shown = live if live is not None else source  # an unlocked session reports the route the profile now holds
+    fallback = _fallback(chain)
     fallback['chain_complete'] = fallback['chain_complete'] and chain_known
     first = _registries(home_doc, source)
     second = _registries(home_doc, source)
@@ -524,7 +462,7 @@ def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, secrets
     webhooks_complete = '' not in hosts and (raw_outbound is None or (isinstance(raw_outbound, list) and all(
         isinstance(entry, dict) and isinstance(entry.get('url'), str) and _host(entry['url']) for entry in raw_outbound)))
     sections = {
-        'primary': primary,
+        'primary': _primary(shown, locked),
         'fallback': fallback,
         'hooks_active': events,
         'outbound_webhooks': {'count': len({url for _, url in wired}),
@@ -533,26 +471,10 @@ def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, secrets
         'observer_plugins': observers,
         'compression': {'checkpoint_required': checkpoint},
     }
-    primary_known = (all(primary[k] for k in ('provider', 'model', 'endpoint_host'))
-                     and primary['credential_kind'] != 'unknown')
-    complete = (session and not managed and not followed and known and agreed and stable and primary_known
+    complete = (locked is not None and session and not managed and not followed and known and agreed and stable
                 and fallback['chain_complete'] and hooks_complete and webhooks_complete and observers_complete
                 and checkpoint is not None)
     return {**sections, 'revision': _revision(sections, complete), 'complete': complete}
-
-
-def _env_names(path):
-    """Names the profile's ``.env`` assigns a non-empty value, presence only, tokenized as execution does
-    (``agent.secret_scope``: last assignment wins). No value leaves this read and ``os.environ`` is untouched. An absent
-    file is empty; None when the file exists but cannot be read (incomplete, fail closed)."""
-    from agent.secret_scope import _decode_env_bytes, _parse_env_text
-    if not path.exists():
-        return frozenset()
-    try:
-        text = _decode_env_bytes(path.read_bytes())
-    except OSError:
-        return None
-    return frozenset(name for name, value in _parse_env_text(text).items() if value.strip())
 
 
 def _file_backend():
@@ -597,17 +519,6 @@ def _managed_worker(policy):
         return True
 
 
-def _secret_paths(authority, policy):
-    """The config paths whose secret values the session holds out of its config. Presence only: no value is read."""
-    from gateway.session_policy_credentials import PREFIX
-    ref = policy.config_secret_ref
-    if ref is None:
-        return set()
-    if ref.startswith(PREFIX):
-        return {tuple(path) for path, _ in json.loads(ref[len(PREFIX):])['entries']}
-    return set(getattr(authority, '_local_config_secrets', {}).get(ref) or ())
-
-
 async def runtime_policy(connection, ref, params, policy):
     """Native-owner connection only, read-only projection of the effective runtime route: what a managed client
     checks before its first prompt. Non-secret by construction. Every section reads the frozen session snapshot
@@ -615,36 +526,39 @@ async def runtime_policy(connection, ref, params, policy):
     read is informational and never complete."""
     if not connection.native_owner:
         raise RuntimeStoreError('permission_denied')
+    return await projected_runtime_policy(connection, ref, policy)
+
+
+async def projected_runtime_policy(connection, ref, policy):
+    """The projection itself, for the getter (after its native-owner gate) and the ``prompt.submit`` revision fence."""
     home = Path(connection.authority.profile_id)
     agent = connection.authority.agent(ref) if policy is not None else None
     runner = getattr(connection.authority, 'runner', None)
 
     def read():
+        from gateway import session_route_lock
         from gateway.run import _profile_runtime_scope
         from gateway.session_policy import present_sections
         from hermes_cli.fallback_config import get_fallback_chain
         if not _file_backend():  # decided before any scope: a remote backend is never read or prepared
             return {'runtime_policy': _runtime_policy(
-                {}, {}, chain={}, chain_known=False, checkpoint=None, secrets=set(), bound=False,
+                {}, {}, chain={}, chain_known=False, checkpoint=None, locked=None,
                 session=policy is not None, managed=False, known=False)}
         # Unhydrated: a getter never runs a configured secret source; it reads only the published snapshot.
         with _profile_runtime_scope(home, hydrate_secrets=False):
             doc, home_ok = _home_state(home)
-            env = _env_names(home / '.env')
-            home_ok = home_ok and env is not None
-            env = env or frozenset()
             live_ok = home_ok and not _managed_overlay_active()
             if policy is None:
                 named = _named(doc)
-                retained_ok = _runner_chains_agree(runner, home, get_fallback_chain(doc), env, named)
-                known = live_ok and not named and retained_ok and not _retained_disagrees(home, doc, env, named)
+                retained_ok = _runner_chains_agree(runner, home, get_fallback_chain(doc))
+                known = live_ok and not named and retained_ok and not _retained_disagrees(home, doc)
                 return {'runtime_policy': _runtime_policy(
                     doc, doc, chain=doc, chain_known=known, checkpoint=_checkpoint_required(doc) if live_ok else None,
-                    secrets=set(), bound=False, session=False, managed=False, known=home_ok, env=env, named=named)}
+                    locked=None, session=False, managed=False, known=home_ok)}
             frozen = present_sections(json.loads(policy.config_json))
             named = _named(frozen, doc)
             resident_ok = not _resident_fallback_active(agent)
-            retained_ok = resident_ok and _runner_chains_agree(runner, home, get_fallback_chain(doc), env, named)
+            retained_ok = resident_ok and _runner_chains_agree(runner, home, get_fallback_chain(doc))
             if policy.safe_mode:
                 chain, chain_known = {}, retained_ok and not named
             elif policy.ignore_user_config:
@@ -652,15 +566,15 @@ async def runtime_policy(connection, ref, params, policy):
             else:
                 chain = doc
                 chain_known = (live_ok and retained_ok and not named
-                               and not _retained_disagrees(home, doc, env, named))
+                               and not _retained_disagrees(home, doc))
             checkpoint_known = policy.ignore_user_config or live_ok
             checkpoint_source = frozen if policy.ignore_user_config else doc
             return {'runtime_policy': _runtime_policy(
                 doc, frozen, chain=chain, chain_known=chain_known,
                 checkpoint=_checkpoint_required(checkpoint_source) if checkpoint_known else None,
-                secrets=_secret_paths(connection.authority, policy), bound=policy.credential_ref is not None,
+                locked=policy if session_route_lock.is_locked(policy) else None,
                 session=True, managed=_managed_worker(policy), known=home_ok, followed=bool(policy.followed_sections),
-                live=None if policy.safe_mode else doc, env=env, named=named)}
+                live=None if policy.safe_mode else doc)}
     return await asyncio.to_thread(read)
 
 

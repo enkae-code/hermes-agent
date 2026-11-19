@@ -143,6 +143,9 @@ class LocalSessionPolicy:
     config_secret_ref: str | None = None
     editor_mcp_json: str | None = None
     kanban_json: str | None = None
+    # Route lock (``fallback: "none"``): the frozen primary route plus a salted credential identity. Private:
+    # never in ``request_json``, never exported (``gateway/session_route_lock.py``).
+    route_lock_json: str | None = None
     # Troubleshooting isolation is derived by the owner at creation and frozen with the
     # route; safe_mode always implies ignore_user_config (normalized once in build_policy).
     safe_mode: bool = False
@@ -1028,6 +1031,14 @@ def route_launch_key(authority, policy, config):
     return launch_key(authority, policy)
 
 
+def _valid_route_lock(raw):
+    if raw is None:
+        return True
+    from gateway.session_route_lock import FIELDS
+    lock = json.loads(raw)
+    return isinstance(lock, dict) and set(lock) == {*FIELDS, 'salt', 'credential_id'}
+
+
 def restore_policy(data):
     """Reject incomplete private policy rather than rebuilding from current defaults."""
     try:
@@ -1043,6 +1054,7 @@ def restore_policy(data):
                 or type(policy.safe_mode) is not bool or type(policy.ignore_user_config) is not bool
                 or not isinstance(policy.skills_prompt, (str, type(None)))
                 or type(policy.coding_posture) is not bool
+                or not _valid_route_lock(policy.route_lock_json)
                 or not _valid_client_env(policy.client_env_json) or type(policy.client_env_remote) is not bool
                 or not _valid_client_env(policy.client_env_rules_json, list)
                 or policy.edit_approval_policy not in EDIT_APPROVAL_POLICIES
