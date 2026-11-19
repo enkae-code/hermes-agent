@@ -283,5 +283,6 @@ def test_runtime_describe_advertises_the_capability(tmp_path):
                     "capabilities"
                 ]
                 assert "runtime-policy-v1" in capabilities
+                assert "route-lock-v1" in capabilities
 
         asyncio.run(probe())
