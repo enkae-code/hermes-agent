@@ -3,6 +3,7 @@ import asyncio
 from functools import partial
 import hashlib
 import json
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -226,21 +227,46 @@ def _project(params, policy, cfg):
 
 _CREDENTIAL_KINDS = {'api_key': 'api_key', 'oauth_device_code': 'oauth', 'oauth_external': 'oauth',
                      'external_process': 'cli'}
-_KEY_REFERENCES = ('api_key', 'api_key_env', 'key_env')
+# Public identifiers only. Config values can carry expanded secrets, so a value is emitted only when it is a
+# short token of this grammar; containers, ``${VAR}`` refs and free text are never stringified into a field.
+_IDENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}')
+_HOST_LABEL = r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+_HOST = re.compile(rf'{_HOST_LABEL}(?:\.{_HOST_LABEL})*')
+
+
+def _ident(value):
+    """``value`` as a public identifier, else None."""
+    text = value.strip() if isinstance(value, str) else ''
+    return text if _IDENT.fullmatch(text) else None
+
+
+def _host(url):
+    """The hostname of ``url`` alone: userinfo, port, path and query never reach the result."""
+    try:
+        host = urlsplit(url).hostname if isinstance(url, str) and url else None
+    except ValueError:
+        host = None
+    return host if host and _HOST.fullmatch(host) else ''
+
+
+def _literal_key(value):
+    """A key the route names itself. A ``${VAR}`` reference, an empty value or a non-string is not a key."""
+    return isinstance(value, str) and bool(value.strip()) and '$' not in value
 
 
 def _route(entry, model):
-    """``(identity, base_url)`` for one route. An api_key provider is ``api_key`` only when the route
-    names its key itself; an env-only key is not verified here, so it reads ``unknown``. Nothing from
-    the key, the URL path, query or headers is returned."""
+    """``(identity, base_url)`` for one route. An api_key provider is ``api_key`` only when the route names
+    a literal key itself; an env-only or unresolved key reads ``unknown``. A provider outside the catalog is
+    not emitted. Nothing from the key, the URL path, query or headers is returned."""
     from hermes_cli.providers import get_provider
-    provider = str(entry.get('provider') or '').strip()
+    provider = _ident(entry.get('provider'))
     pdef = get_provider(provider, allow_network=False) if provider else None
     kind = _CREDENTIAL_KINDS.get(pdef.auth_type) if pdef else None
-    if kind == 'api_key' and not any(entry.get(k) for k in _KEY_REFERENCES):
+    if kind == 'api_key' and not _literal_key(entry.get('api_key')):
         kind = None
     base = entry.get('base_url') or (pdef.base_url if pdef else '')
-    return {'provider': provider, 'model': model, 'credential_kind': kind or 'unknown'}, base
+    identity = {'provider': provider if pdef else None, 'model': _ident(model), 'credential_kind': kind or 'unknown'}
+    return identity, base
 
 
 def _fallback(source):
@@ -250,11 +276,13 @@ def _fallback(source):
         candidates = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
         complete = complete and (raw is None or isinstance(raw, (dict, list))) and all(
             isinstance(e, dict) and e.get('provider') and e.get('model') for e in candidates)
-    providers = [_route(entry, str(entry['model']).strip())[0] for entry in get_fallback_chain(source)]
-    complete = complete and all(row['credential_kind'] != 'unknown' for row in providers)
-    legacy = source.get('fallback_model')
-    return {'providers': providers, 'legacy_fallback_model': legacy.get('model') if isinstance(legacy, dict) else None,
-            'chain_complete': complete}
+    providers = [_route(entry, entry.get('model'))[0] for entry in get_fallback_chain(source)]
+    complete = complete and all(
+        row['credential_kind'] != 'unknown' and row['provider'] and row['model'] for row in providers)
+    legacy_raw = source.get('fallback_model')
+    legacy = _ident(legacy_raw.get('model')) if isinstance(legacy_raw, dict) else None
+    complete = complete and (legacy_raw is None or legacy is not None)
+    return {'providers': providers, 'legacy_fallback_model': legacy, 'chain_complete': complete}
 
 
 def _checkpoint_required(cfg):
@@ -269,44 +297,90 @@ def _checkpoint_required(cfg):
     return value if isinstance(value, bool) else None
 
 
-def _observers():
-    from hermes_cli.plugins import get_plugin_manager
-    manager = get_plugin_manager()
-    rows = [{'name': p.manifest.name, 'events': sorted(p.hooks_registered)}
-            for p in manager._plugins.values() if p.enabled and not p.error and p.hooks_registered]
-    return rows, manager._discovered
+def _observers(home_doc):
+    """``(rows, complete)``: the lifecycle observers that run, from the live registries. Never discovers,
+    waits or calls ``enabled()`` (which can tear a runtime down). Discovery in flight or not yet run is unknown."""
+    from agent.safe_worker_policy import safe_worker_enabled
+    if safe_worker_enabled():
+        return [], True
+    from hermes_cli.observability.relay_shared_metrics import HANDLED_HOOKS
+    from hermes_cli.plugins import _loaded_registry_nowait
+    rows = _loaded_registry_nowait(lambda m: [
+        {'name': p.manifest.name, 'events': sorted(p.hooks_registered)}
+        for p in m._plugins.values() if p.enabled and not p.error and p.hooks_registered])
+    if rows is False:
+        return [], False
+    telemetry = home_doc.get('telemetry')
+    shared = telemetry.get('shared_metrics') if isinstance(telemetry, dict) else None
+    if isinstance(shared, dict) and shared.get('enabled') is True:
+        rows.append({'name': 'shared_metrics', 'events': sorted(HANDLED_HOOKS)})
+    return rows, all(_ident(row['name']) == row['name'] for row in rows)
 
 
-def _runtime_policy(cfg, source):
-    """The projection. ``source`` is the route's config (the frozen snapshot for a config-only session,
-    else the live profile config); hooks, webhooks, observers and compression are the live registries."""
-    from agent.outbound_webhooks import iter_configured_targets
+def _revision(sections, complete):
+    """Digest of every projected field and ``complete``; set-like observer rows in canonical order."""
+    rows = sorted(sections['observer_plugins'], key=lambda row: json.dumps(row, sort_keys=True))
+    payload = {**sections, 'observer_plugins': rows, 'complete': complete}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def _runtime_policy(home_doc, source, known):
+    """The projection of ``source``: the frozen snapshot for a session, else the home's own config read.
+    ``known`` is False when that route or the home config could not be read whole. Hooks, webhooks and
+    observers are the live registries; the YAML only validates them."""
+    from agent.outbound_webhooks import iter_configured_targets, registered_targets
     from agent.shell_hooks import consented_hook_state
     model = source.get('model')
     route = model if isinstance(model, dict) else {}
     name = model if isinstance(model, str) else route.get('default') or route.get('model')
-    identity, base = _route(route, str(name or '').strip())
-    primary = {**identity, 'endpoint_host': urlsplit(base).hostname or '' if base else ''}
+    identity, base = _route(route, name)
+    primary = {**identity, 'endpoint_host': _host(base)}
     fallback = _fallback(source)
-    events, hooks_complete = consented_hook_state(cfg)
-    targets = iter_configured_targets(cfg)
-    observers, observers_complete = _observers()
-    checkpoint = _checkpoint_required(cfg)
+    events, hooks_complete = consented_hook_state(source)
+    targets = iter_configured_targets(source)
+    raw_hooks = source.get('hooks')
+    raw_outbound = raw_hooks.get('outbound') if isinstance(raw_hooks, dict) else None
+    wired = registered_targets()
+    hosts = {_host(url) for _, url in wired}
+    webhooks_complete = '' not in hosts and (
+        raw_outbound is None or (isinstance(raw_outbound, list) and len(targets) == len(raw_outbound)))
+    observers, observers_complete = _observers(home_doc)
+    checkpoint = _checkpoint_required(source)
     sections = {
         'primary': primary,
         'fallback': fallback,
         'hooks_active': events,
-        'outbound_webhooks': {'count': len(targets), 'events': sorted({e for t in targets for e in t.events}),
-                              'hosts': sorted({urlsplit(t.url).hostname or '' for t in targets} - {''})},
+        'outbound_webhooks': {'count': len({url for _, url in wired}),
+                              'events': sorted({event for event, _ in wired}),
+                              'hosts': sorted(hosts - {''})},
         'observer_plugins': observers,
         'compression': {'checkpoint_required': checkpoint},
     }
     primary_known = (all(primary[k] for k in ('provider', 'model', 'endpoint_host'))
                      and primary['credential_kind'] != 'unknown')
-    complete = (primary_known and fallback['chain_complete'] and hooks_complete and observers_complete
-                and checkpoint is not None)
-    digest = hashlib.sha256(json.dumps(sections, sort_keys=True).encode()).hexdigest()[:16]
-    return {**sections, 'revision': digest, 'complete': complete}
+    complete = (known and primary_known and fallback['chain_complete'] and hooks_complete and webhooks_complete
+                and observers_complete and checkpoint is not None)
+    return {**sections, 'revision': _revision(sections, complete), 'complete': complete}
+
+
+def _home_doc(home):
+    """``(doc, readable)``: the profile's own config.yaml, read with no write, hydration or env expansion."""
+    from hermes_cli.config_backend import read_config_doc_readonly
+    try:
+        doc = read_config_doc_readonly(home / 'config.yaml')
+    except Exception:
+        return {}, False
+    if doc is None:
+        return {}, True
+    return (doc, True) if isinstance(doc, dict) else ({}, False)
+
+
+def _managed_overlay_active():
+    from hermes_cli.managed_scope import load_managed_config
+    try:
+        return bool(load_managed_config())
+    except Exception:
+        return True
 
 
 async def runtime_policy(connection, ref, params):
@@ -318,13 +392,15 @@ async def runtime_policy(connection, ref, params):
     home = Path(connection.authority.profile_id)
 
     def read():
-        from gateway.run import _profile_runtime_scope
-        from hermes_cli.config import load_config
-        with _profile_runtime_scope(home):
-            cfg = load_config()
-            source = policy.config(connection.authority, secrets=False) if (
-                policy is not None and policy.ignore_user_config) else cfg
-            return {'runtime_policy': _runtime_policy(cfg, source)}
+        from gateway.session_policy import present_sections
+        doc, home_ok = _home_doc(home)
+        if policy is None:
+            # The raw read applies no managed overlay: a managed layer leaves the route unknown.
+            return {'runtime_policy': _runtime_policy(doc, doc, home_ok and not _managed_overlay_active())}
+        # The session's route is its frozen snapshot. A following session also reads the live profile,
+        # which this read does not do (a cold read writes backups), so its route is not resolvable here.
+        frozen = present_sections(json.loads(policy.config_json))
+        return {'runtime_policy': _runtime_policy(doc, frozen, home_ok and not policy.followed_sections)}
     return await asyncio.to_thread(read)
 
 

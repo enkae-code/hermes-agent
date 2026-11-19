@@ -122,6 +122,13 @@ def iter_configured_targets(cfg: Optional[dict[str, Any]]) -> list[WebhookTarget
     return [t for t in (_parse_single_target(i, entry) for i, entry in enumerate(raw)) if t is not None]
 
 
+def registered_targets() -> list[tuple[str, str]]:
+    """``(event, url)`` pairs this home's process has wired: the live registry, not the YAML."""
+    home_key = _home_key()
+    with _registered_lock:
+        return sorted((key[1], key[2]) for key in _registered if key[0] == home_key)
+
+
 def flush(timeout: float = 5.0) -> bool:
     """Block until all queued deliveries are done (or *timeout* elapses); True if drained."""
     def _drained() -> bool:
