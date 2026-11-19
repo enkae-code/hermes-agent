@@ -9,7 +9,12 @@ import pytest
 from gateway import session_config
 from tests.gateway.fixtures.local_recovery_probe import rpc, websocket
 from tests.gateway.test_session_busy_controls import owner
-from tests.gateway.test_session_runtime_policy import LEAKY_URL, PRIMARY, SENTINELS, _read
+from tests.gateway.test_session_runtime_policy import (
+    LEAKY_URL,
+    PRIMARY,
+    SENTINELS,
+    _read,
+)
 
 
 def _create(ws):
@@ -40,7 +45,11 @@ def test_identity_fields_refuse_containers_env_refs_and_userinfo(tmp_path):
     config = {
         "model": model,
         "fallback_providers": [],
-        "fallback_model": {"provider": "openrouter", "api_key": "SENTINEL-KEY", "model": {"SENTINEL-MAP": "x"}},
+        "fallback_model": {
+            "provider": "openrouter",
+            "api_key": "SENTINEL-KEY",
+            "model": {"SENTINEL-MAP": "x"},
+        },
     }
     with owner(tmp_path, config) as (home, _, desc):
 
@@ -78,7 +87,11 @@ def test_unresolved_key_reference_is_unknown_not_api_key(tmp_path, api_key_field
 
 @pytest.mark.platforms("linux")
 def test_pinned_session_keeps_its_frozen_route_after_a_profile_edit(tmp_path):
-    with owner(tmp_path, {"model": {**PRIMARY, "default": "frozen-model"}}) as (home, _, desc):
+    with owner(tmp_path, {"model": {**PRIMARY, "default": "frozen-model"}}) as (
+        home,
+        _,
+        desc,
+    ):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -109,14 +122,19 @@ def test_unreadable_config_makes_the_projection_incomplete(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_webhook_removed_from_yaml_without_reload_is_still_reported(tmp_path):
-    config = {"model": PRIMARY, "hooks": {"outbound": [{"url": LEAKY_URL, "events": ["post_tool_call"]}]}}
+    config = {
+        "model": PRIMARY,
+        "hooks": {"outbound": [{"url": LEAKY_URL, "events": ["post_tool_call"]}]},
+    }
     with owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
                 await _create(ws)
                 _write(home, {"model": PRIMARY})
-                webhooks = (await _read(ws))["result"]["runtime_policy"]["outbound_webhooks"]
+                webhooks = (await _read(ws))["result"]["runtime_policy"][
+                    "outbound_webhooks"
+                ]
                 assert webhooks == {
                     "count": 1,
                     "events": ["post_tool_call"],
@@ -128,7 +146,12 @@ def test_webhook_removed_from_yaml_without_reload_is_still_reported(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_malformed_webhook_entry_is_incomplete(tmp_path):
-    config = {"model": PRIMARY, "hooks": {"outbound": [{"url": LEAKY_URL, "events": ["post_tool_call"]}, {"bogus": 1}]}}
+    config = {
+        "model": PRIMARY,
+        "hooks": {
+            "outbound": [{"url": LEAKY_URL, "events": ["post_tool_call"]}, {"bogus": 1}]
+        },
+    }
     with owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
@@ -156,14 +179,25 @@ def test_enabled_first_party_observer_is_reported(monkeypatch):
 
     monkeypatch.setattr(get_plugin_manager(), "_discovered", True)
     monkeypatch.setattr(get_plugin_manager(), "_hooks", {})
-    rows, complete = session_config._observers({"telemetry": {"shared_metrics": {"enabled": True}}})
+    rows, complete = session_config._observers(
+        {"telemetry": {"shared_metrics": {"enabled": True}}}
+    )
     assert complete is True
     assert [row["name"] for row in rows] == ["shared_metrics"], rows
     assert rows[0]["events"], rows
 
 
 def test_revision_covers_completeness_and_ignores_observer_order():
-    sections = {"observer_plugins": [{"name": "a", "events": ["x"]}, {"name": "b", "events": ["y"]}]}
+    sections = {
+        "observer_plugins": [
+            {"name": "a", "events": ["x"]},
+            {"name": "b", "events": ["y"]},
+        ]
+    }
     reordered = {"observer_plugins": list(reversed(sections["observer_plugins"]))}
-    assert session_config._revision(sections, True) != session_config._revision(sections, False)
-    assert session_config._revision(sections, True) == session_config._revision(reordered, True)
+    assert session_config._revision(sections, True) != session_config._revision(
+        sections, False
+    )
+    assert session_config._revision(sections, True) == session_config._revision(
+        reordered, True
+    )

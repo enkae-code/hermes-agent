@@ -387,7 +387,7 @@ def _home_state(home):
         return {}, False
     try:
         doc = read_config_doc_readonly(home / 'config.yaml')
-    except Exception:
+    except Exception:  # health: allow BLE001 -- refusal gate: any read failure reports unreadable (fail closed)
         return {}, False
     if doc is None:
         return {}, True
@@ -398,7 +398,7 @@ def _managed_overlay_active():
     from hermes_cli.managed_scope import load_managed_config
     try:
         return bool(load_managed_config())
-    except Exception:
+    except Exception:  # health: allow BLE001 -- refusal gate: an unreadable overlay counts as active (fail closed)
         return True
 
 
