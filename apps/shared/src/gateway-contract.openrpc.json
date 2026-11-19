@@ -8224,6 +8224,19 @@
             "default": null,
             "title": "Value"
           },
+          "runtime_policy": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runtime Policy"
+          },
           "display": {
             "anyOf": [
               {
@@ -13148,7 +13161,7 @@
       },
       "ConfigGetResult": {
         "additionalProperties": false,
-        "description": "Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,\n``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,\n``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``.",
+        "description": "Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,\n``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,\n``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``,\n``runtime_policy`` for the main-only route projection.",
         "properties": {
           "value": {
             "anyOf": [
@@ -13161,6 +13174,19 @@
             ],
             "default": null,
             "title": "Value"
+          },
+          "runtime_policy": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runtime Policy"
           },
           "display": {
             "anyOf": [

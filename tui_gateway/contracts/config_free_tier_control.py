@@ -42,9 +42,11 @@ class ConfigProviderRef(OpenModel):
 class ConfigGetResult(Result):
     """Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``,
     ``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``,
-    ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``."""
+    ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``,
+    ``runtime_policy`` for the main-only route projection."""
 
     value: str | None = None
+    runtime_policy: dict[str, JsonValue] | None = None
     display: str | None = None
     tool_progress: str | None = None
     model: str | None = None

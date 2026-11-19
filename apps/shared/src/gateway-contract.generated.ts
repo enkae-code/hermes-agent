@@ -492,9 +492,10 @@ export interface ConfigGetParams {
   cwd?: string | null
   session_id?: string | null
 }
-/** Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``, ``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``, ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``. */
+/** Union of every getter's payload: ``value`` for the simple words, ``config`` for ``full``, ``mtime`` / ``mcp_rev`` for the poller, ``model`` / ``provider`` / ``providers`` for ``provider``, ``home`` / ``display`` for ``profile``, ``cwd`` / ``branch`` for ``project``, ``prompt``, ``runtime_policy`` for the main-only route projection. */
 export interface ConfigGetResult {
   value?: string | null
+  runtime_policy?: Record<string, unknown> | null
   display?: string | null
   tool_progress?: string | null
   model?: string | null
@@ -5472,6 +5473,7 @@ export interface CanonicalReplaceQueuedParams {
 }
 export interface CanonicalConfigGetResult {
   value?: string | null
+  runtime_policy?: Record<string, unknown> | null
   display?: string | null
   tool_progress?: string | null
   model?: string | null

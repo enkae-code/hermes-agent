@@ -4,6 +4,7 @@ from functools import partial
 import hashlib
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from hermes_state_runtime import RuntimeStoreError
 
@@ -76,6 +77,8 @@ async def config_get(connection, ref, params):
         raise RuntimeStoreError('invalid_params')
     if key == 'voice':
         return _voice(connection, ref)
+    if key == 'runtime_policy':
+        return await runtime_policy(connection, ref, params)
     agent = connection.authority.agent(ref) if ref.session_id else None
 
     def read():
@@ -219,6 +222,110 @@ def _project(params, policy, cfg):
         from agent.runtime_cwd import resolve_agent_cwd
         cwd = str(resolve_agent_cwd())
     return {'cwd': cwd, 'branch': git_probe.branch(cwd)}
+
+
+_CREDENTIAL_KINDS = {'api_key': 'api_key', 'oauth_device_code': 'oauth', 'oauth_external': 'oauth',
+                     'external_process': 'cli'}
+_KEY_REFERENCES = ('api_key', 'api_key_env', 'key_env')
+
+
+def _route(entry, model):
+    """``(identity, base_url)`` for one route. An api_key provider is ``api_key`` only when the route
+    names its key itself; an env-only key is not verified here, so it reads ``unknown``. Nothing from
+    the key, the URL path, query or headers is returned."""
+    from hermes_cli.providers import get_provider
+    provider = str(entry.get('provider') or '').strip()
+    pdef = get_provider(provider, allow_network=False) if provider else None
+    kind = _CREDENTIAL_KINDS.get(pdef.auth_type) if pdef else None
+    if kind == 'api_key' and not any(entry.get(k) for k in _KEY_REFERENCES):
+        kind = None
+    base = entry.get('base_url') or (pdef.base_url if pdef else '')
+    return {'provider': provider, 'model': model, 'credential_kind': kind or 'unknown'}, base
+
+
+def _fallback(source):
+    from hermes_cli.fallback_config import get_fallback_chain
+    complete = True
+    for raw in (source.get('fallback_providers'), source.get('fallback_model')):
+        candidates = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
+        complete = complete and (raw is None or isinstance(raw, (dict, list))) and all(
+            isinstance(e, dict) and e.get('provider') and e.get('model') for e in candidates)
+    providers = [_route(entry, str(entry['model']).strip())[0] for entry in get_fallback_chain(source)]
+    complete = complete and all(row['credential_kind'] != 'unknown' for row in providers)
+    legacy = source.get('fallback_model')
+    return {'providers': providers, 'legacy_fallback_model': legacy.get('model') if isinstance(legacy, dict) else None,
+            'chain_complete': complete}
+
+
+def _checkpoint_required(cfg):
+    section = cfg.get('compression')
+    if section is None:
+        return False
+    if not isinstance(section, dict):
+        return None
+    value = section.get('checkpoint_required')
+    if value is None:
+        return False
+    return value if isinstance(value, bool) else None
+
+
+def _observers():
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    rows = [{'name': p.manifest.name, 'events': sorted(p.hooks_registered)}
+            for p in manager._plugins.values() if p.enabled and not p.error and p.hooks_registered]
+    return rows, manager._discovered
+
+
+def _runtime_policy(cfg, source):
+    """The projection. ``source`` is the route's config (the frozen snapshot for a config-only session,
+    else the live profile config); hooks, webhooks, observers and compression are the live registries."""
+    from agent.outbound_webhooks import iter_configured_targets
+    from agent.shell_hooks import consented_hook_state
+    model = source.get('model')
+    route = model if isinstance(model, dict) else {}
+    name = model if isinstance(model, str) else route.get('default') or route.get('model')
+    identity, base = _route(route, str(name or '').strip())
+    primary = {**identity, 'endpoint_host': urlsplit(base).hostname or '' if base else ''}
+    fallback = _fallback(source)
+    events, hooks_complete = consented_hook_state(cfg)
+    targets = iter_configured_targets(cfg)
+    observers, observers_complete = _observers()
+    checkpoint = _checkpoint_required(cfg)
+    sections = {
+        'primary': primary,
+        'fallback': fallback,
+        'hooks_active': events,
+        'outbound_webhooks': {'count': len(targets), 'events': sorted({e for t in targets for e in t.events}),
+                              'hosts': sorted({urlsplit(t.url).hostname or '' for t in targets} - {''})},
+        'observer_plugins': observers,
+        'compression': {'checkpoint_required': checkpoint},
+    }
+    primary_known = (all(primary[k] for k in ('provider', 'model', 'endpoint_host'))
+                     and primary['credential_kind'] != 'unknown')
+    complete = (primary_known and fallback['chain_complete'] and hooks_complete and observers_complete
+                and checkpoint is not None)
+    digest = hashlib.sha256(json.dumps(sections, sort_keys=True).encode()).hexdigest()[:16]
+    return {**sections, 'revision': digest, 'complete': complete}
+
+
+async def runtime_policy(connection, ref, params):
+    """Main-only (the native owner connection), read-only projection of the effective runtime route:
+    what a managed client checks before its first prompt. Non-secret by construction."""
+    if not connection.native_owner:
+        raise RuntimeStoreError('permission_denied')
+    policy = _authorize(connection, ref, params)
+    home = Path(connection.authority.profile_id)
+
+    def read():
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.config import load_config
+        with _profile_runtime_scope(home):
+            cfg = load_config()
+            source = policy.config(connection.authority, secrets=False) if (
+                policy is not None and policy.ignore_user_config) else cfg
+            return {'runtime_policy': _runtime_policy(cfg, source)}
+    return await asyncio.to_thread(read)
 
 
 async def model_options(connection, ref, params):

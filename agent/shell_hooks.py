@@ -335,6 +335,15 @@ def iter_configured_hooks(cfg: Optional[dict[str, Any]]) -> list[ShellHookSpec]:
     return _parse_hooks_block(cfg.get("hooks")) if isinstance(cfg, dict) else []
 
 
+def consented_hook_state(cfg: Optional[dict[str, Any]]) -> tuple[list[str], bool]:
+    """``(events, complete)``: the shell-hook events this home has registered (consent given), and
+    whether every configured ``hooks:`` entry parsed. A malformed entry makes the state incomplete."""
+    home_key = _home_key()
+    with _registered_lock:
+        events = sorted({key[1] for key in _registered if key[0] == home_key})
+    return events, _parse_hooks(cfg.get("hooks") if isinstance(cfg, dict) else None)[1]
+
+
 def re_register_config_hooks() -> None:
     """Re-register after a plugin force-reload cleared the manager's hooks; only this home's keys
     are cleared (profile A's reload never drops B), never re-prompts.
