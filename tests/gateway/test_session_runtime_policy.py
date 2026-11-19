@@ -27,17 +27,27 @@ SENTINELS = (
 )
 
 
+# The certified shape (round 7): the key is the profile .env's, the endpoint is the built-in one, no YAML key.
+CERTIFIED = {"provider": "openrouter", "default": "primary-model"}
+
+
+def policy_owner(tmp_path, config=None):
+    # S4: the harness's loopback OPENAI_BASE_URL is an endpoint override; the projection must see it absent.
+    return owner(tmp_path, config, extra_env={"OPENAI_BASE_URL": ""})
+
+
 def _read(ws, **params):
     return rpc(ws, "config.get", key="runtime_policy", **params)
 
 
 @pytest.mark.platforms("linux")
 def test_api_key_primary_with_empty_fallback_is_complete(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
         home,
         _,
         desc,
     ):
+        (home / ".env").write_text("OPENROUTER_API_KEY=SENTINEL-ENV-KEY\n")
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -70,7 +80,7 @@ def test_api_key_primary_with_empty_fallback_is_complete(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_primary_without_an_explicit_key_reference_is_unknown_and_incomplete(tmp_path):
-    with owner(
+    with policy_owner(
         tmp_path, {"model": {"provider": "openrouter", "default": "primary-model"}}
     ) as (home, _, desc):
 
@@ -91,7 +101,7 @@ def test_fallback_providers_and_legacy_fallback_model_are_both_reported(tmp_path
         "fallback_providers": [{**fallback, "model": "listed-fallback"}],
         "fallback_model": {**fallback, "model": "legacy-fallback"},
     }
-    with owner(tmp_path, config) as (home, _, desc):
+    with policy_owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -102,9 +112,9 @@ def test_fallback_providers_and_legacy_fallback_model_are_both_reported(tmp_path
                     "listed-fallback",
                     "legacy-fallback",
                 ]
-                assert fallback_view["providers"][0]["credential_kind"] == "api_key"
+                assert fallback_view["providers"][0]["credential_kind"] == "unknown"  # S5: a YAML key is not certified
                 assert fallback_view["legacy_fallback_model"] == "legacy-fallback"
-                assert fallback_view["chain_complete"] is True
+                assert fallback_view["chain_complete"] is False  # S7: any fallback chain is incomplete
 
         asyncio.run(probe())
 
@@ -128,7 +138,7 @@ def test_no_credential_url_path_query_or_header_reaches_the_projection(tmp_path)
         },
         "hooks_auto_accept": True,
     }
-    with owner(tmp_path, config) as (home, _, desc):
+    with policy_owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -159,7 +169,7 @@ def test_active_hooks_webhooks_and_observers_are_reported(tmp_path):
         },
         "hooks_auto_accept": True,
     }
-    with owner(tmp_path, config) as (home, _, desc):
+    with policy_owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -201,11 +211,12 @@ def test_active_hooks_webhooks_and_observers_are_reported(tmp_path):
 def test_checkpoint_required_is_projected_and_unknown_is_incomplete(
     tmp_path, compression, expected
 ):
-    with owner(tmp_path, {"model": PRIMARY, "compression": compression}) as (
+    with policy_owner(tmp_path, {"model": CERTIFIED, "compression": compression}) as (
         home,
         _,
         desc,
     ):
+        (home / ".env").write_text("OPENROUTER_API_KEY=SENTINEL-ENV-KEY\n")
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -229,7 +240,7 @@ def test_checkpoint_required_is_projected_and_unknown_is_incomplete(
 
 @pytest.mark.platforms("linux")
 def test_non_native_owner_connection_is_refused(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY}) as (_, _, desc):
+    with policy_owner(tmp_path, {"model": PRIMARY}) as (_, _, desc):
 
         async def probe():
             other_url = (
@@ -244,7 +255,7 @@ def test_non_native_owner_connection_is_refused(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_revision_is_stable_until_a_projected_field_changes(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
+    with policy_owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -266,7 +277,7 @@ def test_revision_is_stable_until_a_projected_field_changes(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_runtime_describe_advertises_the_capability(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
+    with policy_owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:

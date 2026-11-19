@@ -8,8 +8,9 @@ import pytest
 
 from gateway import session_config
 from tests.gateway.fixtures.local_recovery_probe import rpc, websocket
-from tests.gateway.test_session_busy_controls import owner
 from tests.gateway.test_session_runtime_policy import (
+    CERTIFIED,
+    policy_owner,
     LEAKY_URL,
     PRIMARY,
     SENTINELS,
@@ -51,7 +52,7 @@ def test_identity_fields_refuse_containers_env_refs_and_userinfo(tmp_path):
             "model": {"SENTINEL-MAP": "x"},
         },
     }
-    with owner(tmp_path, config) as (home, _, desc):
+    with policy_owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -74,7 +75,7 @@ def test_identity_fields_refuse_containers_env_refs_and_userinfo(tmp_path):
 )
 def test_unresolved_key_reference_is_unknown_not_api_key(tmp_path, api_key_fields):
     model = {"provider": "openrouter", "default": "primary-model", **api_key_fields}
-    with owner(tmp_path, {"model": model}) as (home, _, desc):
+    with policy_owner(tmp_path, {"model": model}) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -89,7 +90,7 @@ def test_unresolved_key_reference_is_unknown_not_api_key(tmp_path, api_key_field
 def test_pinned_session_reports_the_live_route_and_is_incomplete_after_a_profile_edit(
     tmp_path,
 ):
-    with owner(tmp_path, {"model": {**PRIMARY, "default": "frozen-model"}}) as (
+    with policy_owner(tmp_path, {"model": {**PRIMARY, "default": "frozen-model"}}) as (
         home,
         _,
         desc,
@@ -113,7 +114,7 @@ def test_pinned_session_reports_the_live_route_and_is_incomplete_after_a_profile
 
 @pytest.mark.platforms("linux")
 def test_unreadable_config_makes_the_projection_incomplete(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
+    with policy_owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -130,7 +131,7 @@ def test_webhook_removed_from_yaml_without_reload_is_still_reported(tmp_path):
         "model": PRIMARY,
         "hooks": {"outbound": [{"url": LEAKY_URL, "events": ["post_tool_call"]}]},
     }
-    with owner(tmp_path, config) as (home, _, desc):
+    with policy_owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -156,7 +157,7 @@ def test_malformed_webhook_entry_is_incomplete(tmp_path):
             "outbound": [{"url": LEAKY_URL, "events": ["post_tool_call"]}, {"bogus": 1}]
         },
     }
-    with owner(tmp_path, config) as (home, _, desc):
+    with policy_owner(tmp_path, config) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:

@@ -55,7 +55,7 @@ class CorrectionModel(BaseHTTPRequestHandler):
 
 
 @contextmanager
-def owner(tmp_path, config=None):
+def owner(tmp_path, config=None, extra_env=None):
     root = Path(__file__).resolve().parents[2]
     home, user = tmp_path / 'state', tmp_path / 'user'
     home.mkdir(mode=0o700)
@@ -81,6 +81,7 @@ def owner(tmp_path, config=None):
     env.update(HOME=str(user), USERPROFILE=str(user), HERMES_HOME=str(home), PYTHONPATH=str(root),
         OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url, PYTHONUNBUFFERED='1',
         HERMES_DASHBOARD_SESSION_TOKEN='other-controls-actor')
+    env.update(extra_env or {})
     try:
         with daemon(root, home, env, barrier=False) as (_, desc):
             yield home, peer, desc

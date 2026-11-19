@@ -13,8 +13,9 @@ from gateway import session_config
 from hermes_cli.plugins import get_plugin_manager
 from hermes_state_runtime import RuntimeStoreError
 from tests.gateway.fixtures.local_recovery_probe import rpc, websocket
-from tests.gateway.test_session_busy_controls import owner
 from tests.gateway.test_session_runtime_policy import (
+    CERTIFIED,
+    policy_owner,
     LEAKY_URL,
     PRIMARY,
     SENTINELS,
@@ -49,7 +50,7 @@ def _scratch(tmp_path):
 @pytest.mark.platforms("linux")
 def test_ordinary_session_reads_a_fallback_added_after_open(tmp_path):
     fallback = {"provider": "openrouter", "model": "live-fb", "api_key": "SENTINEL-KEY"}
-    with owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
+    with policy_owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -71,7 +72,7 @@ def test_ordinary_session_reads_a_fallback_added_after_open(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_ordinary_session_checkpoint_follows_a_live_edit(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
+    with policy_owner(tmp_path, {"model": PRIMARY}) as (home, _, desc):
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -87,11 +88,12 @@ def test_ordinary_session_checkpoint_follows_a_live_edit(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_pagestone_shaped_session_is_complete(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
         home,
         _,
         desc,
     ):
+        (home / ".env").write_text("OPENROUTER_API_KEY=SENTINEL-ENV-KEY\n")
 
         async def probe():
             async with websocket(home, desc) as ws:
@@ -232,7 +234,7 @@ def test_memory_provider_fallback_hook_is_not_reported_complete(monkeypatch):
 
 
 def test_sentinels_never_reach_a_pagestone_projection(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
         home,
         _,
         desc,

@@ -11,8 +11,7 @@ import pytest
 
 from gateway import session_config
 from tests.gateway.fixtures.local_recovery_probe import rpc, websocket
-from tests.gateway.test_session_busy_controls import owner
-from tests.gateway.test_session_runtime_policy import PRIMARY, SENTINELS, _read
+from tests.gateway.test_session_runtime_policy import CERTIFIED, PRIMARY, policy_owner, SENTINELS, _read
 from tests.gateway.test_session_runtime_policy_r2 import _write
 
 PAGESTONE = {"name": "pagestone", "version": "0.1.0"}
@@ -58,7 +57,7 @@ def _policy_for(home, desc, *, followed=False, **overrides):
 
 
 def test_followed_session_is_incomplete(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -69,7 +68,7 @@ def test_followed_session_is_incomplete(tmp_path):
 
 
 def test_live_edit_disagreeing_with_frozen_fallback_is_incomplete(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -104,7 +103,7 @@ def test_named_provider_is_incomplete_and_unknown(tmp_path):
             }
         }
     }
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": [], **named}) as (
+    with policy_owner(tmp_path, {"model": PRIMARY, "fallback_providers": [], **named}) as (
         home,
         _,
         desc,
@@ -143,7 +142,7 @@ def _seed_catalog(monkeypatch):
 
 
 def test_env_key_without_a_declared_catalog_is_unknown(tmp_path):
-    with owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": {"provider": "anthropic", "default": "primary-model"}, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -158,7 +157,7 @@ def test_env_key_without_a_declared_catalog_is_unknown(tmp_path):
 
 def test_profile_env_key_is_api_key_by_presence_only(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -168,12 +167,12 @@ def test_profile_env_key_is_api_key_by_presence_only(tmp_path, monkeypatch):
         policy = json.loads(raw)["result"]["runtime_policy"]
         assert policy["complete"] is True, policy
         assert policy["primary"]["credential_kind"] == "api_key", policy
-        assert policy["primary"]["endpoint_host"] == "api.example.test", policy
+        assert policy["primary"]["endpoint_host"] == "openrouter.ai", policy
         assert "SENTINEL-ENV-KEY" not in raw
 
 
 def test_env_endpoint_override_makes_host_unknown(tmp_path):
-    with owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": PRIMARY, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -282,7 +281,7 @@ def test_retained_chain_that_disagrees_is_detected(tmp_path, monkeypatch):
 
 def test_sentinels_absent_from_pagestone_env_key_result(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
         home,
         _,
         desc,

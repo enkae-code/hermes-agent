@@ -10,8 +10,7 @@ import pytest
 from gateway import session_config
 from hermes_constants import hermes_home_key
 from tests.gateway.fixtures.local_recovery_probe import rpc, websocket
-from tests.gateway.test_session_busy_controls import owner
-from tests.gateway.test_session_runtime_policy import PRIMARY, _read
+from tests.gateway.test_session_runtime_policy import CERTIFIED, PRIMARY, policy_owner, _read
 from tests.gateway.test_session_runtime_policy_r4 import (
     NO_KEY,
     _create_pagestone,
@@ -45,7 +44,7 @@ def _no_pool(monkeypatch):
 
 @pytest.mark.platforms("linux")
 def test_subscription_token_in_env_is_not_api_key(tmp_path):
-    with owner(tmp_path, {"model": ANTHROPIC, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": ANTHROPIC, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -60,7 +59,7 @@ def test_subscription_token_in_env_is_not_api_key(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_anthropic_api_key_env_alone_is_unknown(tmp_path):
-    with owner(tmp_path, {"model": ANTHROPIC, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": ANTHROPIC, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -75,7 +74,7 @@ def test_anthropic_api_key_env_alone_is_unknown(tmp_path):
 
 @pytest.mark.platforms("linux")
 def test_azure_entra_route_with_literal_key_is_unknown(tmp_path):
-    with owner(tmp_path, {"model": AZURE, "fallback_providers": []}) as (home, _, desc):
+    with policy_owner(tmp_path, {"model": AZURE, "fallback_providers": []}) as (home, _, desc):
         raw, _ = _policy_for(home, desc)
         policy = _policy(raw)
         assert policy["primary"]["credential_kind"] == "unknown", policy
@@ -86,7 +85,7 @@ def test_azure_entra_route_with_literal_key_is_unknown(tmp_path):
 @pytest.mark.platforms("linux")
 def test_key_reassigned_empty_in_env_is_not_api_key(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -110,19 +109,20 @@ def test_non_api_key_pool_row_makes_static_key_route_unknown(monkeypatch):
     # Unit: the daemon regenerates its pool from the .env key at session start, so the row is injected here.
     from hermes_cli import auth
 
-    entry = {"provider": "openrouter", "model": "m", "api_key": "SENTINEL-KEY"}
+    entry = {"provider": "openrouter", "model": "m"}  # the .env key is the certified source, not a YAML key
+    env = frozenset({"OPENROUTER_API_KEY"})
     monkeypatch.setattr(
         auth,
         "read_credential_pool",
         lambda provider=None: [{"auth_type": "oauth", "source": "hermes_pkce"}],
     )
-    assert session_config._route(entry, "m")[0]["credential_kind"] == "unknown"
+    assert session_config._route(entry, "m", env=env)[0]["credential_kind"] == "unknown"
     monkeypatch.setattr(
         auth,
         "read_credential_pool",
         lambda provider=None: [{"auth_type": "api_key", "source": "env:X"}],
     )
-    assert session_config._route(entry, "m")[0]["credential_kind"] == "api_key"
+    assert session_config._route(entry, "m", env=env)[0]["credential_kind"] == "api_key"
 
 
 def _entry(model, base="https://fb.example.test/v1"):
@@ -169,7 +169,7 @@ def _samples(monkeypatch, first, second):
     monkeypatch.setattr(outbound, "registered_targets", list)
     monkeypatch.setattr(session_config, "_observers", lambda home_doc: ([], True))
     _no_pool(monkeypatch)
-    doc = {"model": PRIMARY}
+    doc = {"model": CERTIFIED}
     return session_config._runtime_policy(
         doc,
         doc,
@@ -181,6 +181,7 @@ def _samples(monkeypatch, first, second):
         session=True,
         managed=False,
         known=True,
+        env=frozenset({"OPENROUTER_API_KEY"}),
     )
 
 
@@ -230,7 +231,7 @@ def test_invalid_observer_label_is_replaced_and_incomplete(monkeypatch):
 @pytest.mark.platforms("linux")
 def test_pagestone_shape_declares_editor_mcp_and_stays_complete(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": NO_KEY, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": CERTIFIED, "fallback_providers": []}) as (
         home,
         _,
         desc,

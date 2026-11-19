@@ -229,12 +229,16 @@ def _project(params, policy, cfg):
     return {'cwd': cwd, 'branch': git_probe.branch(cwd)}
 
 
-# Providers whose resolver reads one static key with no OAuth, pool, subscription, Entra or app-server route.
-# Verified: openrouter (hermes_cli/providers.py:30; not in runtime_provider.py:931 _OAUTH_RUNTIME_PROVIDERS) and
-# deepseek (hermes_cli/auth.py:218 single DEEPSEEK_API_KEY row). Excluded: anthropic (CLAUDE_CODE_OAUTH_TOKEN,
-# hermes_cli/auth.py:205-209), azure-foundry (Entra, runtime_provider.py:1167-1172), openai (codex app-server
-# rewrite, runtime_provider.py:338-350), xai (xai-oauth, runtime_provider.py:931-939), and every unverified provider.
-_STATIC_KEY_PROVIDERS = frozenset({'openrouter', 'deepseek'})
+# Certified shape (round 7, binding). complete=true only when every rule holds; any other profile is unknown and
+# incomplete, without modelling it. S1 provider is exactly 'openrouter' or 'deepseek' (no alias, no normalization,
+# no catalog lookup for any other name). S2 model.api_mode absent or 'chat_completions'. S3 model.base_url absent or
+# the catalog base_url after rstrip('/'). S4 no OPENROUTER/DEEPSEEK/CUSTOM/OPENAI_BASE_URL in any scope (presence).
+# S5 the key is the profile .env's declared variable, the only source certified; a YAML key, a key_env pointer, a
+# launch key, numbered or extra env keys, or a non-api_key or foreign pool row is unknown. S6 a secrets block or a
+# non-file config backend is unknown, decided before any scope. S7 any fallback chain is incomplete.
+_STATIC_KEY_PROVIDERS = {'openrouter': 'OPENROUTER_API_KEY', 'deepseek': 'DEEPSEEK_API_KEY'}
+_ENDPOINT_OVERRIDES = ('OPENROUTER_BASE_URL', 'DEEPSEEK_BASE_URL', 'CUSTOM_BASE_URL', 'OPENAI_BASE_URL')
+_YAML_KEY_FIELDS = ('api_key', 'api', 'key_env', 'api_key_env')
 # Public identifiers only. Config values can carry expanded secrets, so a value is emitted only when it is a
 # short token of this grammar; containers, ``${VAR}`` refs and free text are never stringified into a field.
 _IDENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}')
@@ -257,90 +261,60 @@ def _host(url):
     return host if host and _HOST.fullmatch(host) else ''
 
 
-def _literal_key(value):
-    """A key the route names itself. A ``${VAR}`` reference, an empty value or a non-string is not a key."""
-    return isinstance(value, str) and bool(value.strip()) and '$' not in value
+def _override_present(var, env):
+    """True when an endpoint override is set in any scope execution may read: the routed (non-hydrating) scope,
+    the process environment or the profile .env. Presence only."""
+    from agent.secret_scope import get_secret_str
+    return var in env or bool(os.environ.get(var, '').strip()) or bool(get_secret_str(var, '').strip())
 
 
-def _static_key_route(provider, pdef):
-    """True when ``provider`` is allowlisted and this profile holds no other credential route for it: no pool row that
-    is not an api_key (an unreadable pool counts as one) and no implicit env var. Read-only, profile-scoped by caller."""
+def _canonical(provider):
+    """``(base_url, key variable)`` of an allowlisted provider, from the code's own registry and constant, never the
+    catalog (its openrouter entry declares neither)."""
+    from hermes_cli.auth import PROVIDER_REGISTRY
+    from hermes_constants import OPENROUTER_BASE_URL
+    base = PROVIDER_REGISTRY[provider].inference_base_url if provider in PROVIDER_REGISTRY else OPENROUTER_BASE_URL
+    return base.rstrip('/'), _STATIC_KEY_PROVIDERS[provider]
+
+
+def _certified_base(entry, canonical, env):
+    """``canonical`` when S2-S4 hold for this route, else ''."""
+    url = entry.get('base_url')
+    if entry.get('api_mode') not in (None, 'chat_completions'):
+        return ''
+    if url is not None and not (isinstance(url, str) and url.rstrip('/') == canonical):
+        return ''
+    if any(_override_present(var, env) for var in _ENDPOINT_OVERRIDES):
+        return ''
+    return canonical
+
+
+def _certified_key(provider, entry, var, canonical, key_present, env):
+    """S5: the profile .env's declared key variable is the one credential source; every other source is unknown."""
     from hermes_cli.auth import _IMPLICIT_ENV_VARS, read_credential_pool
-    if pdef is None or provider not in _STATIC_KEY_PROVIDERS:
+    if key_present or var not in env or var in _IMPLICIT_ENV_VARS or any(entry.get(f) for f in _YAML_KEY_FIELDS):
         return False
-    if any(var in _IMPLICIT_ENV_VARS for var in pdef.api_key_env_vars):
+    if any(name.startswith(var + '_') for name in {*env, *os.environ}):  # numbered or extra env pool keys
         return False
     try:
         rows = read_credential_pool(provider)
-    except Exception:  # health: allow BLE001 -- fail closed: an unreadable pool may hold a subscription row
+    except Exception:  # health: allow BLE001 -- fail closed: an unreadable pool may hold another credential
         return False
-    return all(isinstance(row, dict) and (row.get('auth_type') or 'api_key') == 'api_key' for row in rows)
+    return all(isinstance(row, dict) and row.get('auth_type') == 'api_key'
+               and (not row.get('base_url') or str(row['base_url']).rstrip('/') == canonical) for row in rows)
 
 
-def _pool_bases_agree(provider, base, canonical):
-    """True when every credential-pool row of ``provider`` is empty, or names ``base``'s host or the built-in host:
-    execution takes the selected row's base_url, but rewrites a built-in one to the configured URL. A row on any other
-    host, or an unreadable pool, is not agreement."""
-    from hermes_cli.auth import read_credential_pool
-    try:
-        rows = read_credential_pool(provider)
-    except Exception:  # health: allow BLE001 -- fail closed: an unreadable pool may name another endpoint
-        return False
-    hosts = {host for host in (_host(base), _host(canonical)) if host}
-    return all(isinstance(row, dict) and (not row.get('base_url') or _host(row.get('base_url')) in hosts)
-               for row in rows)
-
-
-# Inputs that can change the effective endpoint host or credential of a route (read from the resolver, round 6):
-#   explicit launch args: explicit_base_url / explicit_api_key (runtime_provider.resolve_runtime_provider) -> the
-#     session's frozen ``model.base_url`` / ``model.api_key`` (``present`` = bound launch key), projected below.
-#   process env (os.environ) and profile .env (presence, ``env``): <PDEF>_BASE_URL (pdef.base_url_env_var, read by
-#     _explicit_api_key_provider and the openrouter backend) and CUSTOM_BASE_URL (runtime_provider_backends.py:119-120,
-#     :135, :144-145: an override that wins over the openrouter URL) -> host unknown. OPENAI_BASE_URL never picks the
-#     endpoint (backends docstring); it only binds OPENAI_API_KEY to an origin, which keeps kind api_key -> not compared.
-#   <PDEF>_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY (env, .env) -> credential presence (kind), via _static_key_route.
-#   auth.json credential pool rows (read_credential_pool): auth_type (non-api_key or unreadable -> kind unknown,
-#     _static_key_route) and base_url (the selected row's base_url is the endpoint, runtime_provider.py:468-469,:599-614)
-#     -> every row's host must be the projected host or the built-in host (execution rewrites a built-in row to the
-#     configured URL), else host unknown (_pool_bases_agree). Path is not projected: host-level agreement only.
-#   config model.provider / model.base_url / model.api_key / model.api / model.key_env / model.api_mode: the primary
-#     route (primary source) and the live config (live); a disagreement -> incomplete (_runtime_policy agreed).
-#   providers: / custom_providers: entries (_named): a route through one is not catalog-derived -> unknown (named).
-#   owned-URL credential (_owned_url_credential / _owning_entry_credential): a providers: entry that owns the URL
-#     supplies its key -> named -> unknown.
-#   fallback chain (fallback_providers, fallback_model dict): provider, model, base_url, api_key, key_env, api_key_env,
-#     api_mode per entry (_chain_key, presence only for declared credentials); a legacy fallback_model dict.
-#   runner retained chain (_fallback_model_by_home, _fallback_model) and the loader's last-known-good config
-#     (_LAST_EXPANDED_CONFIG_BY_PATH): compared to the live chain (_runner_chains_agree, _retained_disagrees).
-#   resident agent fallback activation (_fallback_activated): unknown -> incomplete (_resident_fallback_active).
-#   session frozen overlay (policy.config_json, safe_mode, ignore_user_config, followed sections): frozen source.
-#   managed overlay (load_managed_config), unreadable profile .env / config.yaml, remote config backend: incomplete.
-#   secret sources (``secrets:`` config) never run here; an unpublished snapshot is incomplete (_sources_unpublished).
-#   provider name aliases (expand_direct_api_alias, _ident) and providers.<name>.enabled: unknown identity -> unknown.
 def _route(entry, model, key_present=False, env=frozenset(), named=False):
-    """``(identity, base_url)`` for one route. ``api_key`` only for an allowlisted static-key provider whose route holds
-    a key: a literal one in its config, ``key_present`` (the session's secret map or a bound launch key, by presence
-    only), or a declared key var non-empty in the profile ``.env`` (``env``, presence only). Every other route, every
-    credential kind and every unresolved key reads ``unknown``. A provider outside the catalog, or any route through a
-    ``providers:`` entry (``named``), is not catalog-derived: kind and host are unknown. An env endpoint override or an
-    unresolved ``${VAR}`` makes the host unknown. Nothing from the key, the URL path, query or headers is returned."""
-    from hermes_cli.providers import get_provider
-    provider = _ident(entry.get('provider'))
-    pdef = get_provider(provider, allow_network=False) if provider and not named else None
-    kind = None
-    if pdef and _static_key_route(provider, pdef) and (key_present or _literal_key(entry.get('api_key'))
-                                                       or any(var in env for var in pdef.api_key_env_vars)):
-        kind = 'api_key'
-    base = entry.get('base_url') or (pdef.base_url if pdef else '')
-    overrides = {'CUSTOM_BASE_URL', *([pdef.base_url_env_var] if pdef and pdef.base_url_env_var else [])}
-    if any(var in env or os.environ.get(var, '').strip() for var in overrides):
-        base = ''
-    if pdef and provider in _STATIC_KEY_PROVIDERS and not _pool_bases_agree(provider, base, pdef.base_url):
-        base = ''
-    if named or not isinstance(base, str) or '$' in base:
-        base = ''
-    identity = {'provider': provider if pdef else None, 'model': _ident(model), 'credential_kind': kind or 'unknown'}
-    return identity, base
+    """``(identity, base_url)`` for one route. Only an allowlisted name is resolved (no alias, no catalog lookup for any
+    other name); any other route, and any route through a ``providers:`` / ``secrets:`` entry (``named``), reads
+    credential kind unknown and an empty host. Nothing from the key, URL path, query or headers is returned."""
+    raw = entry.get('provider')
+    kind, base = 'unknown', ''
+    if not named and isinstance(raw, str) and raw in _STATIC_KEY_PROVIDERS:
+        canonical, var = _canonical(raw)
+        if _certified_key(raw, entry, var, canonical, key_present, env):
+            kind, base = 'api_key', _certified_base(entry, canonical, env)
+    return {'provider': _ident(raw), 'model': _ident(model), 'credential_kind': kind}, base
 
 
 def _primary(source, *, present=False, env=frozenset(), named=False):
@@ -352,26 +326,19 @@ def _primary(source, *, present=False, env=frozenset(), named=False):
 
 
 def _named(*docs):
-    """True when a config names a custom provider execution could select (``providers:`` / ``custom_providers:``)."""
-    return any(bool(doc.get(key)) for doc in docs for key in ('providers', 'custom_providers'))
+    """True when a config names a route the certified shape cannot describe: a custom provider (``providers:`` /
+    ``custom_providers:``) or an external secret source (``secrets:``), which is never run here."""
+    return any(bool(doc.get(key)) for doc in docs for key in ('providers', 'custom_providers', 'secrets'))
 
 
 def _fallback(source, env=frozenset(), named=False):
+    """The chain as execution reads it. S7: any entry or legacy ``fallback_model`` leaves the chain incomplete."""
     from hermes_cli.fallback_config import get_fallback_chain
-    complete = True
-    raws = (source.get('fallback_providers'), source.get('fallback_model'))
-    for raw in raws:
-        candidates = [raw] if isinstance(raw, dict) else raw if isinstance(raw, list) else []
-        complete = complete and (raw is None or isinstance(raw, (dict, list))) and all(
-            isinstance(e, dict) and e.get('provider') and e.get('model') for e in candidates)
-    # An unresolved ``${VAR}`` in any entry means the chain is not what execution will resolve.
-    complete = complete and not any('${' in json.dumps(raw, default=str) for raw in raws)
-    providers = [_route(entry, entry.get('model'), env=env, named=named)[0] for entry in get_fallback_chain(source)]
-    complete = complete and all(
-        row['credential_kind'] != 'unknown' and row['provider'] and row['model'] for row in providers)
+    entries = get_fallback_chain(source)
+    providers = [_route(entry, entry.get('model'), env=env, named=named)[0] for entry in entries]
     legacy_raw = source.get('fallback_model')
     legacy = _ident(legacy_raw.get('model')) if isinstance(legacy_raw, dict) else None
-    complete = complete and (legacy_raw is None or legacy is not None)
+    complete = not entries and not any(source.get(key) for key in ('fallback_providers', 'fallback_model'))
     return {'providers': providers, 'legacy_fallback_model': legacy, 'chain_complete': complete}
 
 
@@ -588,6 +555,16 @@ def _env_names(path):
     return frozenset(name for name, value in _parse_env_text(text).items() if value.strip())
 
 
+def _file_backend():
+    """True when the config backend is the local file backend. Decided from the backend's type alone, before any
+    scope or read, so a remote backend's config is never read or prepared for a terminal policy."""
+    from hermes_cli.config_backend import FileBackend, get_config_backend
+    try:
+        return isinstance(get_config_backend(), FileBackend)
+    except (Exception, SystemExit):  # health: allow BLE001 -- an unselectable backend is not the local file (fail closed)
+        return False
+
+
 def _home_state(home):
     """``(doc, readable)``: the profile's own config.yaml, read with no write, hydration or env expansion. A
     remote config backend is not fetched here: its state is not published locally, so it is unreadable."""
@@ -601,14 +578,6 @@ def _home_state(home):
     if doc is None:
         return {}, True
     return (doc, True) if isinstance(doc, dict) else ({}, False)
-
-
-def _sources_unpublished(home, doc):
-    """True when the profile configures external secret sources this process never published. The getter binds
-    without hydration (it may not run a source), so such a profile's source-supplied endpoint or key is unknown."""
-    from hermes_cli import env_loader
-    from hermes_constants import hermes_home_key
-    return bool(doc.get('secrets')) and hermes_home_key(home) not in env_loader._APPLIED_HOMES
 
 
 def _managed_overlay_active():
@@ -654,11 +623,15 @@ async def runtime_policy(connection, ref, params, policy):
         from gateway.run import _profile_runtime_scope
         from gateway.session_policy import present_sections
         from hermes_cli.fallback_config import get_fallback_chain
+        if not _file_backend():  # decided before any scope: a remote backend is never read or prepared
+            return {'runtime_policy': _runtime_policy(
+                {}, {}, chain={}, chain_known=False, checkpoint=None, secrets=set(), bound=False,
+                session=policy is not None, managed=False, known=False)}
         # Unhydrated: a getter never runs a configured secret source; it reads only the published snapshot.
         with _profile_runtime_scope(home, hydrate_secrets=False):
             doc, home_ok = _home_state(home)
             env = _env_names(home / '.env')
-            home_ok = home_ok and env is not None and not _sources_unpublished(home, doc)
+            home_ok = home_ok and env is not None
             env = env or frozenset()
             live_ok = home_ok and not _managed_overlay_active()
             if policy is None:

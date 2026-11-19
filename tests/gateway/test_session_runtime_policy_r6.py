@@ -10,14 +10,13 @@ import pytest
 
 from gateway import session_config
 from hermes_constants import hermes_home_key
-from tests.gateway.test_session_busy_controls import owner
 from tests.gateway.test_session_runtime_policy_r4 import _policy_for, _seed_catalog
+from tests.gateway.test_session_runtime_policy import policy_owner
 from tests.gateway.test_session_runtime_policy_r5 import _samples
 
 OPENROUTER = {
     "provider": "openrouter",
     "default": "primary-model",
-    "api_key": "SENTINEL-KEY",
 }
 
 
@@ -55,11 +54,12 @@ def _catalog_stub(monkeypatch):
 @pytest.mark.platforms("linux")
 def test_openrouter_host_is_canonical_without_endpoint_override(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (
         home,
         _,
         desc,
     ):
+        (home / ".env").write_text("OPENROUTER_API_KEY=SENTINEL-ENV-KEY\n")
         policy = _policy(_policy_for(home, desc)[0])
         assert policy["primary"]["endpoint_host"] == "openrouter.ai", policy
 
@@ -67,7 +67,7 @@ def test_openrouter_host_is_canonical_without_endpoint_override(tmp_path, monkey
 @pytest.mark.platforms("linux")
 def test_profile_env_custom_base_url_overrides_openrouter_host(tmp_path, monkeypatch):
     _seed_catalog(monkeypatch)
-    with owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (
+    with policy_owner(tmp_path, {"model": OPENROUTER, "fallback_providers": []}) as (
         home,
         _,
         desc,
@@ -83,20 +83,19 @@ def test_profile_env_custom_base_url_overrides_openrouter_host(tmp_path, monkeyp
 def test_custom_base_url_in_process_env_makes_static_route_host_unknown(monkeypatch):
     _no_pool(monkeypatch)
     _catalog_stub(monkeypatch)
-    entry = {"provider": "openrouter", "model": "m", "api_key": "SENTINEL-KEY"}
-    assert session_config._host(session_config._route(entry, "m")[1]) == "openrouter.ai"
-    assert (
-        session_config._route(entry, "m", env=frozenset({"CUSTOM_BASE_URL"}))[1] == ""
-    )
+    entry = {"provider": "openrouter", "model": "m"}
+    env = frozenset({"OPENROUTER_API_KEY"})
+    assert session_config._host(session_config._route(entry, "m", env=env)[1]) == "openrouter.ai"
+    assert session_config._route(entry, "m", env=env | {"CUSTOM_BASE_URL"})[1] == ""
     monkeypatch.setenv("CUSTOM_BASE_URL", "https://evil.example.test/v1")
-    assert session_config._route(entry, "m")[1] == ""
+    assert session_config._route(entry, "m", env=env)[1] == ""
 
 
 def test_foreign_pool_row_base_url_makes_static_route_host_unknown(monkeypatch):
     from hermes_cli import auth
 
     _catalog_stub(monkeypatch)
-    entry = {"provider": "deepseek", "model": "m", "api_key": "SENTINEL-KEY"}
+    entry = {"provider": "deepseek", "model": "m"}
     monkeypatch.setattr(
         auth,
         "read_credential_pool",
@@ -104,8 +103,8 @@ def test_foreign_pool_row_base_url_makes_static_route_host_unknown(monkeypatch):
             {"auth_type": "api_key", "base_url": "https://proxy.evil.example.test/v1"}
         ],
     )
-    identity, base = session_config._route(entry, "m")
-    assert identity["credential_kind"] == "api_key", identity
+    identity, base = session_config._route(entry, "m", env=frozenset({"DEEPSEEK_API_KEY"}))
+    assert identity["credential_kind"] == "unknown", identity  # a foreign row makes the credential uncertifiable
     assert base == "", base
 
 
@@ -113,7 +112,8 @@ def test_canonical_or_empty_pool_row_base_url_keeps_host(monkeypatch):
     from hermes_cli import auth
 
     _catalog_stub(monkeypatch)
-    entry = {"provider": "deepseek", "model": "m", "api_key": "SENTINEL-KEY"}
+    entry = {"provider": "deepseek", "model": "m"}
+    env = frozenset({"DEEPSEEK_API_KEY"})
     for row in (
         {"auth_type": "api_key", "base_url": ""},
         {"auth_type": "api_key", "base_url": "https://api.deepseek.com/v1"},
@@ -122,7 +122,7 @@ def test_canonical_or_empty_pool_row_base_url_keeps_host(monkeypatch):
             auth, "read_credential_pool", lambda provider=None, row=row: [row]
         )
         assert (
-            session_config._host(session_config._route(entry, "m")[1])
+            session_config._host(session_config._route(entry, "m", env=env)[1])
             == "api.deepseek.com"
         )
 
@@ -162,14 +162,10 @@ def test_getter_never_invokes_secret_source_resolvers(tmp_path, monkeypatch):
     assert result["runtime_policy"]["complete"] is False
 
 
-def test_unpublished_secret_sources_are_unknown(tmp_path, monkeypatch):
-    from hermes_cli import env_loader
-
-    monkeypatch.setattr(env_loader, "_APPLIED_HOMES", set())
-    assert session_config._sources_unpublished(tmp_path, {"secrets": {"x": 1}}) is True
-    assert session_config._sources_unpublished(tmp_path, {}) is False
-    monkeypatch.setattr(env_loader, "_APPLIED_HOMES", {hermes_home_key(tmp_path)})
-    assert session_config._sources_unpublished(tmp_path, {"secrets": {"x": 1}}) is False
+def test_secret_sources_block_names_the_route():
+    # S6: a secrets block names an uncertifiable route; secret sources are never run by the getter.
+    assert session_config._named({"secrets": {"x": 1}}) is True
+    assert session_config._named({}) is False
 
 
 class _EqualToAnything:
