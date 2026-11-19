@@ -229,8 +229,12 @@ def _project(params, policy, cfg):
     return {'cwd': cwd, 'branch': git_probe.branch(cwd)}
 
 
-_CREDENTIAL_KINDS = {'api_key': 'api_key', 'oauth_device_code': 'oauth', 'oauth_external': 'oauth',
-                     'external_process': 'cli'}
+# Providers whose resolver reads one static key with no OAuth, pool, subscription, Entra or app-server route.
+# Verified: openrouter (hermes_cli/providers.py:30; not in runtime_provider.py:931 _OAUTH_RUNTIME_PROVIDERS) and
+# deepseek (hermes_cli/auth.py:218 single DEEPSEEK_API_KEY row). Excluded: anthropic (CLAUDE_CODE_OAUTH_TOKEN,
+# hermes_cli/auth.py:205-209), azure-foundry (Entra, runtime_provider.py:1167-1172), openai (codex app-server
+# rewrite, runtime_provider.py:338-350), xai (xai-oauth, runtime_provider.py:931-939), and every unverified provider.
+_STATIC_KEY_PROVIDERS = frozenset({'openrouter', 'deepseek'})
 # Public identifiers only. Config values can carry expanded secrets, so a value is emitted only when it is a
 # short token of this grammar; containers, ``${VAR}`` refs and free text are never stringified into a field.
 _IDENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}')
@@ -258,20 +262,35 @@ def _literal_key(value):
     return isinstance(value, str) and bool(value.strip()) and '$' not in value
 
 
+def _static_key_route(provider, pdef):
+    """True when ``provider`` is allowlisted and this profile holds no other credential route for it: no pool row that
+    is not an api_key (an unreadable pool counts as one) and no implicit env var. Read-only, profile-scoped by caller."""
+    from hermes_cli.auth import _IMPLICIT_ENV_VARS, read_credential_pool
+    if pdef is None or provider not in _STATIC_KEY_PROVIDERS:
+        return False
+    if any(var in _IMPLICIT_ENV_VARS for var in pdef.api_key_env_vars):
+        return False
+    try:
+        rows = read_credential_pool(provider)
+    except Exception:  # health: allow BLE001 -- fail closed: an unreadable pool may hold a subscription row
+        return False
+    return all(isinstance(row, dict) and (row.get('auth_type') or 'api_key') == 'api_key' for row in rows)
+
+
 def _route(entry, model, key_present=False, env=frozenset(), named=False):
-    """``(identity, base_url)`` for one route. An api_key provider is ``api_key`` only when the route holds a
-    key: a literal one in its config, ``key_present`` (the session's secret map or a bound launch key, by
-    presence only), or a declared key var non-empty in the profile ``.env`` (``env``, presence only). An
-    unresolved key reads ``unknown``. A provider outside the catalog, or any route through a ``providers:``
-    entry (``named``), is not catalog-derived: kind and host are unknown. An env endpoint override or an
+    """``(identity, base_url)`` for one route. ``api_key`` only for an allowlisted static-key provider whose route holds
+    a key: a literal one in its config, ``key_present`` (the session's secret map or a bound launch key, by presence
+    only), or a declared key var non-empty in the profile ``.env`` (``env``, presence only). Every other route, every
+    credential kind and every unresolved key reads ``unknown``. A provider outside the catalog, or any route through a
+    ``providers:`` entry (``named``), is not catalog-derived: kind and host are unknown. An env endpoint override or an
     unresolved ``${VAR}`` makes the host unknown. Nothing from the key, the URL path, query or headers is returned."""
     from hermes_cli.providers import get_provider
     provider = _ident(entry.get('provider'))
     pdef = get_provider(provider, allow_network=False) if provider and not named else None
-    kind = _CREDENTIAL_KINDS.get(pdef.auth_type) if pdef else None
-    if kind == 'api_key' and not (key_present or _literal_key(entry.get('api_key'))
-                                  or any(var in env for var in pdef.api_key_env_vars)):
-        kind = None
+    kind = None
+    if pdef and _static_key_route(provider, pdef) and (key_present or _literal_key(entry.get('api_key'))
+                                                       or any(var in env for var in pdef.api_key_env_vars)):
+        kind = 'api_key'
     base = entry.get('base_url') or (pdef.base_url if pdef else '')
     if pdef and pdef.base_url_env_var and (pdef.base_url_env_var in env
                                            or os.environ.get(pdef.base_url_env_var, '').strip()):
@@ -356,7 +375,15 @@ def _observers(home_doc):
     shared = telemetry.get('shared_metrics') if isinstance(telemetry, dict) else None
     if isinstance(shared, dict) and shared.get('enabled') is True:
         rows.append({'name': 'shared_metrics', 'events': sorted(HANDLED_HOOKS)})
-    return rows, accounted and all(_ident(row['name']) == row['name'] for row in rows)
+    valid = all(_ident(row['name']) == row['name'] and all(_ident(event) == event for event in row['events'])
+                for row in rows)
+    labelled = [{'name': _label(row['name']), 'events': [_label(event) for event in row['events']]} for row in rows]
+    return labelled, accounted and valid
+
+
+def _label(value):
+    """A public identifier as-is; a free-text plugin name or event never reaches the projection."""
+    return value if isinstance(value, str) and _ident(value) == value else '<invalid>'
 
 
 def _revision(sections, complete):
@@ -388,20 +415,51 @@ def _quiet(logger_name, fn, *args):
         logger.removeFilter(quiet)
 
 
+def _hook_identity():
+    """Each event's live callbacks by object identity, so a replaced hook is a different callback under the same name.
+    The samples hold their callbacks, so an identity is never reused between samples. Read-only."""
+    from hermes_cli.plugins import _loaded_registry_nowait
+    return _loaded_registry_nowait(lambda manager: {event: tuple(cbs) for event, cbs in manager._hooks.items() if cbs})
+
+
 def _registries(home_doc, source):
     """One sample of every live registry the projection reports: shell hooks (consent, parse), wired outbound
-    webhooks and observers. Called twice per read; a difference between the samples is an unstable read."""
+    webhooks, observers and the callback identities. Called twice per read; a difference between the samples is an
+    unstable read."""
     from agent.outbound_webhooks import registered_targets
     from agent.shell_hooks import consented_hook_state
     events, hooks_complete = _quiet('agent.shell_hooks', consented_hook_state, source)
     observers, observers_complete = _observers(home_doc)
-    return events, hooks_complete, registered_targets(), observers, observers_complete
+    return events, hooks_complete, registered_targets(), observers, observers_complete, _hook_identity()
+
+
+def _chain_key(entries, env, named):
+    """Ordered route identities of a fallback chain: provider, model, endpoint, api_mode and key presence. Compared in
+    memory before anything is returned, so an endpoint-only change is a different route."""
+    return [json.dumps([_route(entry, entry.get('model'), env=env, named=named)[0], entry.get('base_url'),
+                        entry.get('api_mode')], sort_keys=True, default=str) for entry in entries]
 
 
 def _chain_view(cfg, env, named):
     """What execution reads from a config for the fallback chain and checkpoint: the agreement key."""
+    from hermes_cli.fallback_config import get_fallback_chain
     fallback = _fallback(cfg, env, named)
-    return fallback['providers'], fallback['legacy_fallback_model'], fallback['chain_complete'], _checkpoint_required(cfg)
+    return (_chain_key(get_fallback_chain(cfg), env, named), fallback['legacy_fallback_model'],
+            fallback['chain_complete'], _checkpoint_required(cfg))
+
+
+def _runner_chains_agree(runner, home, entries, env, named):
+    """True when the runner's retained fallback state for this home (``_fallback_model_by_home``, keyed as the loader in
+    ``gateway/run_config_loaders.py`` keys it) and its ``_fallback_model`` default both match the live chain. Read-only,
+    compared in memory. An unreachable runner is not agreement."""
+    from hermes_constants import hermes_home_key
+    by_home = getattr(runner, '_fallback_model_by_home', None) or {}
+    if not isinstance(by_home, dict) or not hasattr(runner, '_fallback_model'):
+        return False
+    live = _chain_key(entries, env, named)
+    # A home the loader never refreshed has no retained chain of its own; the runner's default still must agree.
+    retained = [by_home[hermes_home_key(home)]] if hermes_home_key(home) in by_home else []
+    return all(_chain_key(chain or [], env, named) == live for chain in [*retained, runner._fallback_model])
 
 
 def _resident_fallback_active(agent):
@@ -437,7 +495,7 @@ def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, secrets
     fallback['chain_complete'] = fallback['chain_complete'] and chain_known
     first = _registries(home_doc, source)
     stable = first == _registries(home_doc, source)
-    events, hooks_complete, wired, observers, observers_complete = first
+    events, hooks_complete, wired, observers, observers_complete, _ = first
     raw_hooks = source.get('hooks')
     raw_outbound = raw_hooks.get('outbound') if isinstance(raw_hooks, dict) else None
     hosts = {_host(url) for _, url in wired}
@@ -463,23 +521,17 @@ def _runtime_policy(home_doc, source, *, chain, chain_known, checkpoint, secrets
 
 
 def _env_names(path):
-    """Names the profile's ``.env`` assigns a non-empty value, presence only: no value leaves this read, and no
-    ``os.environ`` change. None when the file cannot be read (incomplete, fail closed)."""
+    """Names the profile's ``.env`` assigns a non-empty value, presence only, tokenized as execution does
+    (``agent.secret_scope``: last assignment wins). No value leaves this read and ``os.environ`` is untouched. An absent
+    file is empty; None when the file exists but cannot be read (incomplete, fail closed)."""
+    from agent.secret_scope import _decode_env_bytes, _parse_env_text
     if not path.exists():
         return frozenset()
     try:
-        lines = path.read_text(encoding='utf-8-sig').splitlines()
-    except (OSError, UnicodeDecodeError):
+        text = _decode_env_bytes(path.read_bytes())
+    except OSError:
         return None
-    names = set()
-    for line in lines:
-        line = line.strip()
-        if line.startswith('#') or '=' not in line:
-            continue
-        key, _, value = line.removeprefix('export ').partition('=')
-        if value.strip().strip('\'"'):
-            names.add(key.strip())
-    return frozenset(names)
+    return frozenset(name for name, value in _parse_env_text(text).items() if value.strip())
 
 
 def _home_state(home):
@@ -534,39 +586,45 @@ async def runtime_policy(connection, ref, params, policy):
         raise RuntimeStoreError('permission_denied')
     home = Path(connection.authority.profile_id)
     agent = connection.authority.agent(ref) if policy is not None else None
+    runner = getattr(connection.authority, 'runner', None)
 
     def read():
+        from gateway.run import _profile_runtime_scope
         from gateway.session_policy import present_sections
-        doc, home_ok = _home_state(home)
-        env = _env_names(home / '.env')
-        home_ok = home_ok and env is not None
-        env = env or frozenset()
-        live_ok = home_ok and not _managed_overlay_active()
-        if policy is None:
-            named = _named(doc)
-            known = live_ok and not named and not _retained_disagrees(home, doc, env, named)
+        from hermes_cli.fallback_config import get_fallback_chain
+        with _profile_runtime_scope(home):
+            doc, home_ok = _home_state(home)
+            env = _env_names(home / '.env')
+            home_ok = home_ok and env is not None
+            env = env or frozenset()
+            live_ok = home_ok and not _managed_overlay_active()
+            if policy is None:
+                named = _named(doc)
+                retained_ok = _runner_chains_agree(runner, home, get_fallback_chain(doc), env, named)
+                known = live_ok and not named and retained_ok and not _retained_disagrees(home, doc, env, named)
+                return {'runtime_policy': _runtime_policy(
+                    doc, doc, chain=doc, chain_known=known, checkpoint=_checkpoint_required(doc) if live_ok else None,
+                    secrets=set(), bound=False, session=False, managed=False, known=home_ok, env=env, named=named)}
+            frozen = present_sections(json.loads(policy.config_json))
+            named = _named(frozen, doc)
+            resident_ok = not _resident_fallback_active(agent)
+            retained_ok = resident_ok and _runner_chains_agree(runner, home, get_fallback_chain(doc), env, named)
+            if policy.safe_mode:
+                chain, chain_known = {}, retained_ok and not named
+            elif policy.ignore_user_config:
+                chain, chain_known = frozen, retained_ok and not named
+            else:
+                chain = doc
+                chain_known = (live_ok and retained_ok and not named
+                               and not _retained_disagrees(home, doc, env, named))
+            checkpoint_known = policy.ignore_user_config or live_ok
+            checkpoint_source = frozen if policy.ignore_user_config else doc
             return {'runtime_policy': _runtime_policy(
-                doc, doc, chain=doc, chain_known=known, checkpoint=_checkpoint_required(doc) if live_ok else None,
-                secrets=set(), bound=False, session=False, managed=False, known=home_ok, env=env, named=named)}
-        frozen = present_sections(json.loads(policy.config_json))
-        named = _named(frozen, doc)
-        resident_ok = not _resident_fallback_active(agent)
-        if policy.safe_mode:
-            chain, chain_known = {}, resident_ok and not named
-        elif policy.ignore_user_config:
-            chain, chain_known = frozen, resident_ok and not named
-        else:
-            chain = doc
-            chain_known = (live_ok and resident_ok and not named
-                           and not _retained_disagrees(home, doc, env, named))
-        checkpoint_known = policy.ignore_user_config or live_ok
-        checkpoint_source = frozen if policy.ignore_user_config else doc
-        return {'runtime_policy': _runtime_policy(
-            doc, frozen, chain=chain, chain_known=chain_known,
-            checkpoint=_checkpoint_required(checkpoint_source) if checkpoint_known else None,
-            secrets=_secret_paths(connection.authority, policy), bound=policy.credential_ref is not None,
-            session=True, managed=_managed_worker(policy), known=home_ok, followed=bool(policy.followed_sections),
-            live=None if policy.safe_mode else doc, env=env, named=named)}
+                doc, frozen, chain=chain, chain_known=chain_known,
+                checkpoint=_checkpoint_required(checkpoint_source) if checkpoint_known else None,
+                secrets=_secret_paths(connection.authority, policy), bound=policy.credential_ref is not None,
+                session=True, managed=_managed_worker(policy), known=home_ok, followed=bool(policy.followed_sections),
+                live=None if policy.safe_mode else doc, env=env, named=named)}
     return await asyncio.to_thread(read)
 
 
