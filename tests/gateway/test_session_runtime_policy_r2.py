@@ -86,7 +86,9 @@ def test_unresolved_key_reference_is_unknown_not_api_key(tmp_path, api_key_field
 
 
 @pytest.mark.platforms("linux")
-def test_pinned_session_keeps_its_frozen_route_after_a_profile_edit(tmp_path):
+def test_pinned_session_reports_the_live_route_and_is_incomplete_after_a_profile_edit(
+    tmp_path,
+):
     with owner(tmp_path, {"model": {**PRIMARY, "default": "frozen-model"}}) as (
         home,
         _,
@@ -101,7 +103,9 @@ def test_pinned_session_keeps_its_frozen_route_after_a_profile_edit(tmp_path):
                 _write(home, config)
                 pinned = (await _read(ws, session_id=sid))["result"]["runtime_policy"]
                 live = (await _read(ws))["result"]["runtime_policy"]
-                assert pinned["primary"]["model"] == "frozen-model", pinned
+                # Frozen and live disagree: the live value is reported and the read is incomplete (round 4).
+                assert pinned["primary"]["model"] == "edited-model", pinned
+                assert pinned["complete"] is False, pinned
                 assert live["primary"]["model"] == "edited-model", live
 
         asyncio.run(probe())

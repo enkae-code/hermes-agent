@@ -23,18 +23,27 @@ from tests.gateway.test_session_runtime_policy import (
 from tests.gateway.test_session_runtime_policy_r2 import _create, _write
 
 
-def _create_pagestone(ws):
-    # An ordinary session as Pagestone creates it: no profile following, no hooks, no tools.
+def _create_pagestone(ws, cwd):
+    # The spec's create shape: an acp session, no yolo, an explicit empty scratch cwd, no tools or hooks.
     return rpc(
         ws,
         "session.create",
         request_id="policy",
-        source="tui",
+        source="acp",
+        yolo=False,
+        cwd=str(cwd),
+        client={"name": "pagestone", "version": "0.1.0"},
         toolsets=[],
         ignore_rules=True,
         accept_hooks=False,
         follow_profile_config=False,
     )
+
+
+def _scratch(tmp_path):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    return scratch
 
 
 @pytest.mark.platforms("linux")
@@ -53,7 +62,8 @@ def test_ordinary_session_reads_a_fallback_added_after_open(tmp_path):
                 assert [row["model"] for row in after["fallback"]["providers"]] == [
                     "live-fb"
                 ], after
-                assert after["fallback"]["chain_complete"] is True, after
+                assert after["fallback"]["chain_complete"] is False, after
+                assert after["complete"] is False, after
                 assert after["revision"] != before["revision"]
 
         asyncio.run(probe())
@@ -85,11 +95,17 @@ def test_pagestone_shaped_session_is_complete(tmp_path):
 
         async def probe():
             async with websocket(home, desc) as ws:
-                sid = (await _create_pagestone(ws))["result"]["session_id"]
+                sid = (await _create_pagestone(ws, _scratch(tmp_path)))["result"][
+                    "session_id"
+                ]
                 raw = json.dumps(await _read(ws, session_id=sid))
                 policy = json.loads(raw)["result"]["runtime_policy"]
                 assert policy["complete"] is True, policy
                 assert policy["primary"]["credential_kind"] == "api_key", policy
+                assert (
+                    json.loads(raw)["result"]["runtime_policy"]["observer_plugins"]
+                    == []
+                ), policy
                 assert policy["fallback"] == {
                     "providers": [],
                     "legacy_fallback_model": None,
@@ -98,6 +114,8 @@ def test_pagestone_shaped_session_is_complete(tmp_path):
                 assert policy["hooks_active"] == [], policy
                 assert policy["outbound_webhooks"]["count"] == 0, policy
                 assert policy["compression"] == {"checkpoint_required": False}, policy
+                assert policy["primary"]["provider"] == "openrouter", policy
+                assert policy["primary"]["model"] == "primary-model", policy
                 assert "SENTINEL-KEY" not in raw
 
         asyncio.run(probe())
@@ -222,7 +240,9 @@ def test_sentinels_never_reach_a_pagestone_projection(tmp_path):
 
         async def probe():
             async with websocket(home, desc) as ws:
-                sid = (await _create_pagestone(ws))["result"]["session_id"]
+                sid = (await _create_pagestone(ws, _scratch(tmp_path)))["result"][
+                    "session_id"
+                ]
                 raw = json.dumps(await _read(ws, session_id=sid))
                 for sentinel in SENTINELS:
                     assert sentinel not in raw, sentinel
