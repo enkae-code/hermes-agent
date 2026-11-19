@@ -277,6 +277,43 @@ def _static_key_route(provider, pdef):
     return all(isinstance(row, dict) and (row.get('auth_type') or 'api_key') == 'api_key' for row in rows)
 
 
+def _pool_bases_agree(provider, base):
+    """True when every credential-pool row of ``provider`` is empty or names ``base``'s host: execution takes the
+    selected row's own base_url. An unreadable pool is not agreement."""
+    from hermes_cli.auth import read_credential_pool
+    try:
+        rows = read_credential_pool(provider)
+    except Exception:  # health: allow BLE001 -- fail closed: an unreadable pool may name another endpoint
+        return False
+    return all(isinstance(row, dict) and (not row.get('base_url') or _host(row.get('base_url')) == _host(base))
+               for row in rows)
+
+
+# Inputs that can change the effective endpoint host or credential of a route (read from the resolver, round 6):
+#   explicit launch args: explicit_base_url / explicit_api_key (runtime_provider.resolve_runtime_provider) -> the
+#     session's frozen ``model.base_url`` / ``model.api_key`` (``present`` = bound launch key), projected below.
+#   process env (os.environ) and profile .env (presence, ``env``): <PDEF>_BASE_URL (pdef.base_url_env_var, read by
+#     _explicit_api_key_provider and the openrouter backend) and CUSTOM_BASE_URL (runtime_provider_backends.py:119-120,
+#     :135, :144-145: an override that wins over the openrouter URL) -> host unknown. OPENAI_BASE_URL never picks the
+#     endpoint (backends docstring); it only binds OPENAI_API_KEY to an origin, which keeps kind api_key -> not compared.
+#   <PDEF>_API_KEY / OPENROUTER_API_KEY / OPENAI_API_KEY (env, .env) -> credential presence (kind), via _static_key_route.
+#   auth.json credential pool rows (read_credential_pool): auth_type (non-api_key or unreadable -> kind unknown,
+#     _static_key_route) and base_url (the selected row's base_url is the endpoint, runtime_provider.py:468-469,:599-614)
+#     -> every row's host must equal the projected host, else host unknown (_pool_bases_agree).
+#   config model.provider / model.base_url / model.api_key / model.api / model.key_env / model.api_mode: the primary
+#     route (primary source) and the live config (live); a disagreement -> incomplete (_runtime_policy agreed).
+#   providers: / custom_providers: entries (_named): a route through one is not catalog-derived -> unknown (named).
+#   owned-URL credential (_owned_url_credential / _owning_entry_credential): a providers: entry that owns the URL
+#     supplies its key -> named -> unknown.
+#   fallback chain (fallback_providers, fallback_model dict): provider, model, base_url, api_key, key_env, api_key_env,
+#     api_mode per entry (_chain_key, presence only for declared credentials); a legacy fallback_model dict.
+#   runner retained chain (_fallback_model_by_home, _fallback_model) and the loader's last-known-good config
+#     (_LAST_EXPANDED_CONFIG_BY_PATH): compared to the live chain (_runner_chains_agree, _retained_disagrees).
+#   resident agent fallback activation (_fallback_activated): unknown -> incomplete (_resident_fallback_active).
+#   session frozen overlay (policy.config_json, safe_mode, ignore_user_config, followed sections): frozen source.
+#   managed overlay (load_managed_config), unreadable profile .env / config.yaml, remote config backend: incomplete.
+#   secret sources (``secrets:`` config) never run here; an unpublished snapshot is incomplete (_sources_unpublished).
+#   provider name aliases (expand_direct_api_alias, _ident) and providers.<name>.enabled: unknown identity -> unknown.
 def _route(entry, model, key_present=False, env=frozenset(), named=False):
     """``(identity, base_url)`` for one route. ``api_key`` only for an allowlisted static-key provider whose route holds
     a key: a literal one in its config, ``key_present`` (the session's secret map or a bound launch key, by presence
@@ -292,8 +329,10 @@ def _route(entry, model, key_present=False, env=frozenset(), named=False):
                                                        or any(var in env for var in pdef.api_key_env_vars)):
         kind = 'api_key'
     base = entry.get('base_url') or (pdef.base_url if pdef else '')
-    if pdef and pdef.base_url_env_var and (pdef.base_url_env_var in env
-                                           or os.environ.get(pdef.base_url_env_var, '').strip()):
+    overrides = {'CUSTOM_BASE_URL', *([pdef.base_url_env_var] if pdef and pdef.base_url_env_var else [])}
+    if any(var in env or os.environ.get(var, '').strip() for var in overrides):
+        base = ''
+    if pdef and provider in _STATIC_KEY_PROVIDERS and not _pool_bases_agree(provider, base):
         base = ''
     if named or not isinstance(base, str) or '$' in base:
         base = ''
