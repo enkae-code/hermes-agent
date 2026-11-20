@@ -13,6 +13,8 @@ _PASSTHROUGH_PARAMS = (
     # Model response configuration (None = provider/model default)
     "max_tokens", "reasoning_config", "service_tier",
     "side_agent", "bot_turn", "memory_agent_context",
+    # A route-locked agent never refreshes, rotates or swaps its credential (agent.client_lifecycle).
+    "route_locked",
 )
 # Gateway identity params stored as ``agent._<name>``. gateway_session_key is the stable
 # per-chat key (e.g. agent:main:telegram:dm:123).

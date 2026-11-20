@@ -455,6 +455,9 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
         _refuse('api_key', 'must be a non-empty string')
     if 'fallback' in params and params['fallback'] != 'none':
         _refuse('fallback', 'must be "none" when set')
+    if params.get('fallback') == 'none' and params.get('toolsets') != []:
+        # Default-deny: a locked session's tools could call another model (delegation, cron, kanban, vision, moa).
+        _refuse('toolsets', 'must be [] when fallback is "none"; editor MCP servers are declared in editor')
     model = params.get('model')
     if 'model' in params and (not isinstance(model, str) or not model.strip()):
         _refuse('model', 'must be a non-empty string')

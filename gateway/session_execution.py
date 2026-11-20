@@ -168,7 +168,9 @@ class GatewaySessionAgentMixin:
         return ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
-            enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
+            # A locked agent runs exactly its frozen tools (none, plus declared editor MCP): no later pick adds one.
+            enabled_toolsets=list(policy.toolsets) if is_locked(policy) else ctx.enabled_toolsets,
+            disabled_toolsets=ctx.disabled_toolsets,
             ephemeral_system_prompt=combined_ephemeral or None,
             prefill_messages=(session_prefill(active_authority(runner), policy, src.chat_id) if policy
                               else runner._prefill_messages) or None,
@@ -192,6 +194,7 @@ class GatewaySessionAgentMixin:
             # A locked session has one request path: no external memory provider, no review fork.
             skip_memory=bool(policy and policy.ignore_rules) or is_bot or is_locked(policy),
             skip_background_review=is_locked(policy),
+            route_locked=is_locked(policy),
             bot_turn=is_bot,
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);

@@ -803,7 +803,7 @@ def _get_aux_model_for_provider(provider_id: str, *, prefer_fast: bool = False) 
         from providers import get_provider_profile
         profile = get_provider_profile(provider_id)
     picked = ""
-    if prefer_fast:
+    if prefer_fast and not route_is_locked():  # resolve_aux_model may discover live too
         picked = _fast_model_from_catalog(provider_id)
         if not picked and profile is not None:
             try:
@@ -864,7 +864,7 @@ def _resolve_provider_vision_default(provider: str) -> Optional[str]:
     """Provider default vision model id, or None: static ``_PROVIDER_VISION_MODELS`` (vision-only
     names absent from any catalog) win, else ``ProviderProfile.default_vision_model()``."""
     static = _PROVIDER_VISION_MODELS.get(provider)
-    if static:
+    if static or route_is_locked():  # no live discovery on a locked route
         return static
     try:
         from providers import get_provider_profile
@@ -3657,6 +3657,8 @@ _CREDENTIAL_REFRESHERS: dict[str, Callable[..., bool]] = {
 
 def _refresh_provider_credentials(provider: str, *, failed_api_key: str = "") -> bool:
     """Refresh short-lived credentials for OAuth-backed auxiliary providers."""
+    if route_is_locked():  # a locked route keeps the credential it froze
+        return False
     normalized = _normalize_aux_provider(provider)
     refresher = _CREDENTIAL_REFRESHERS.get(normalized)
     if refresher is None:

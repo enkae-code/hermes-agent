@@ -979,7 +979,7 @@ def recover_with_credential_pool(
     rotating. ``classified_reason`` beats raw HTTP codes (e.g. Anthropic 400 "out of extra
     usage"); ``billing_unverified`` gives the entry a short cooldown, not the one-hour bench."""
     pool = agent._credential_pool
-    if pool is None:
+    if pool is None or getattr(agent, "route_locked", False):
         return False, has_retried_429
     # The pool belongs to the PRIMARY provider: acting on fallback errors would corrupt its state
     # and reset base_url to the primary endpoint. Empty pool provider means unscoped; empty agent

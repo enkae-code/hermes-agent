@@ -3,6 +3,7 @@
 ``ClientLifecycleMixin`` owns task cleanup, the shared primary client, per-request client caches
 (owner-thread close vs stranger-thread abort), credential rotation and route-derived headers.
 """
+import functools
 import logging
 import threading
 import time
@@ -98,6 +99,14 @@ def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb
         agent._client_kwargs["timeout"] = timeout
         # Rebuild now so the timeout applies to the very next request, not only after a rotation rebuild.
         agent._replace_primary_openai_client(reason="fallback_timeout_apply")
+
+
+def _unless_route_locked(method):
+    """A route-locked agent sends the credential it froze: a refresh, rotation or swap changes nothing (False)."""
+    @functools.wraps(method)
+    def inner(self, *args, **kwargs):
+        return False if getattr(self, "route_locked", False) else method(self, *args, **kwargs)
+    return inner
 
 
 class ClientLifecycleMixin:
@@ -576,6 +585,7 @@ class ClientLifecycleMixin:
         self._sync_client_kwargs_credentials()
         return self._replace_primary_openai_client(reason=reason)
 
+    @_unless_route_locked
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
             return False
@@ -613,6 +623,7 @@ class ClientLifecycleMixin:
             return False
         return self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
 
+    @_unless_route_locked
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:
         # Portal serves anthropic/* on the native Messages route, so either client kind may hold the expiring JWT.
         if self.provider != "nous" or self.api_mode not in ("chat_completions", "anthropic_messages"):
@@ -760,6 +771,7 @@ class ClientLifecycleMixin:
         # Adopt only while the session still runs on the registry default or the previously-seen env value.
         return (base_url, api_key) != prev and current_base in {default_base, prev[0]} and not unchanged
 
+    @_unless_route_locked
     def _try_refresh_env_client_credentials(self) -> bool:
         """Adopt ``~/.hermes/.env`` credential/base-url edits at the turn boundary (a Settings save updates ``.env``
         but a live worker keeps init-time values). Adoption rule: ``_should_adopt_env_credentials``.
@@ -804,6 +816,7 @@ class ClientLifecycleMixin:
         logger.info("Applied updated .env credentials for %s: endpoint %s", self.provider, self.base_url)
         return True
 
+    @_unless_route_locked
     def _try_refresh_vertex_client_credentials(self) -> bool:
         """Re-mint the Vertex OAuth2 token (~1h TTL; long sessions 401 on the expired bearer) and rebuild the client."""
         if self.api_mode != "chat_completions" or self.provider != "vertex":
@@ -821,6 +834,7 @@ class ClientLifecycleMixin:
             logger.info("Vertex AI OAuth token refreshed")
         return ok
 
+    @_unless_route_locked
     def _try_refresh_provider_runtime_credentials(self, *, reason: str) -> bool:
         """Re-mint the live credential through the provider profile's ``refresh_runtime_credentials``
         and rebuild the shared client (caller enforces the single-shot guard). ``reason``:
@@ -841,6 +855,7 @@ class ClientLifecycleMixin:
         self._apply_client_headers_for_base_url(str(self.base_url or ""))
         return self._replace_primary_openai_client(reason=f"{profile.name}_credential_{reason}")
 
+    @_unless_route_locked
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         # Only native Anthropic rotates OAuth tokens; other anthropic_messages providers (MiniMax, Alibaba, ...)
         # and Azure use static keys — a refresh would pick up the ~/.claude OAuth token and break auth.
@@ -939,6 +954,7 @@ class ClientLifecycleMixin:
         if merged:
             self._client_kwargs["default_headers"] = merged
 
+    @_unless_route_locked
     def _swap_credential(self, entry) -> bool:
         """Adopt *entry* as the live credential. Returns False, changing nothing, when the entry's
         route cannot serve this conversation's model (a conversation's model is never rewritten by a
