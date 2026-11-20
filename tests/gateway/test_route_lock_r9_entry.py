@@ -220,16 +220,25 @@ async def _review_turn(o, monkeypatch, locked):
         return real(self, **kw)
 
     monkeypatch.setattr(run_agent.AIAgent, "_sync_external_memory_for_turn", spy)
-    ref = await _session(o, locked, turn=False, toolsets=["memory"])
+    # A locked session is created with no toolsets (round 10) and so never has the memory nudge on its own;
+    # its finalizer is driven with the review forced due (test below) instead.
+    ref = await _session(o, locked, turn=False, **({} if locked else {"toolsets": ["memory"]}))
     await o.turn(ref, "remember this")
     agent = o.authority.agent(ref)
-    assert agent is not None and agent._memory_nudge_interval == 1 and "memory" in agent.valid_tool_names
+    assert agent is not None and (locked or agent._memory_nudge_interval == 1 and "memory" in agent.valid_tool_names)
     return ref, agent, syncs
 
 
 @pytest.mark.asyncio
 async def test_locked_turn_forks_no_review_and_syncs_no_memory(owner, monkeypatch):
     _ref, agent, syncs = await _review_turn(owner, monkeypatch, True)
+    from agent.turn_finalizer import _mirror_turn_to_memory
+
+    forks = []
+    monkeypatch.setattr(agent, "_spawn_background_review", lambda **kw: forks.append(kw))
+    _mirror_turn_to_memory(agent, original_user_message="x", final_response="y", interrupted=False,
+                           messages=[], review_memory=True, review_skills=True, vetoed=False)
+    assert forks == []  # a review forced due on a locked agent still forks nothing
     with suppress(AssertionError):  # the fork runs after delivery, on a thread: give it time to (wrongly) appear
         await async_wait_until(lambda: _n(owner) > 1, timeout=6, what="a review fork")
     assert _n(owner) == 1, "exactly the turn request: no review fork on primary or backup"

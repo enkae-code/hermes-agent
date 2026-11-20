@@ -16,7 +16,7 @@ def test_fallback_none_is_the_only_accepted_fallback_value(tmp_path):
     with pytest.raises(RuntimeStoreError) as caught:
         build_policy({"cwd": str(tmp_path), "fallback": "any"}, dict(_CFG))
     assert (caught.value.reason, caught.value.field) == ("invalid_params", "fallback")
-    build_policy({"cwd": str(tmp_path), "fallback": "none"}, dict(_CFG))
+    build_policy({"cwd": str(tmp_path), "fallback": "none", "toolsets": []}, dict(_CFG))
 
 
 @pytest.mark.parametrize(
