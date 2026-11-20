@@ -87,6 +87,22 @@ def test_injects_only_into_bot_chat_on_managed_install(tmp_path):
     assert len(agent.tools) == 1
 
 
+def test_route_locked_bot_chat_gets_no_message_agent_tool(tmp_path):
+    """A route-locked session exposes no model-calling tool, even in a managed Bot Chat."""
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+    agent.route_locked = True
+    assert bot_mode_dm.message_agent_authorized(agent) is False
+    assert bot_mode_dm.ensure_message_agent_tool(agent) is False
+    assert agent.tools == [] and agent.valid_tool_names == set()
+
+
+def test_only_a_literal_true_route_lock_withholds_message_agent(tmp_path):
+    agent = _FakeAgent(_managed_home(tmp_path), title="Bot Chat")
+    agent.route_locked = object()  # truthy but not the lock flag, as on a MagicMock agent
+    assert bot_mode_dm.message_agent_authorized(agent) is True
+
+
 def test_restores_allowlist_when_schema_survives_surface_refresh(tmp_path):
     """#96105: success must restore the executor allowlist on the
     schema-present branch.

@@ -105,7 +105,7 @@ def _unless_route_locked(method):
     """A route-locked agent sends the credential it froze: a refresh, rotation or swap changes nothing (False)."""
     @functools.wraps(method)
     def inner(self, *args, **kwargs):
-        return False if getattr(self, "route_locked", False) else method(self, *args, **kwargs)
+        return False if getattr(self, "route_locked", False) is True else method(self, *args, **kwargs)
     return inner
 
 
