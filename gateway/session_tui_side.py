@@ -49,6 +49,8 @@ def _admit(connection, ref, params, prefix, required='text', optional=()):
     policy = policy_for_source(authority.runner, live.source)
     if policy is None:
         raise RuntimeStoreError('permission_denied')
+    from gateway.session_route_lock import refuse_if_locked
+    refuse_if_locked(policy)  # a side agent is a second request path; a locked session has exactly one
     return live, policy, text, f'{prefix}_{uuid.uuid4().hex[:6]}'
 
 

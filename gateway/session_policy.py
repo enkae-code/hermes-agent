@@ -1203,7 +1203,8 @@ def policy_scope(policy, *, authority=None, home=None):
         # session never reads the profile: its side tasks use its own saved section (code defaults only).
         aux_scope = (session_auxiliary_scope(policy.config(authority, secrets=False).get('auxiliary'))
                      if policy.ignore_user_config else contextlib.nullcontext())
-        with (editor_scope(policy), editor_mcp_scope(authority, policy), aux_scope,
+        from gateway.session_route_lock import aux_scope as locked_aux_scope
+        with (editor_scope(policy), editor_mcp_scope(authority, policy), aux_scope, locked_aux_scope(policy),
               policy.client_env_scope()):
             yield
     finally:

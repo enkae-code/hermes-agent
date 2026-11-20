@@ -806,6 +806,9 @@ class AuthorityConnection:
             self._record_voice_stop(ref, params)
             return {'voice_stopped': True}
         # The interactive WS is the one surface a restart's after-turn wait admits (#139041).
+        self.authority.authorize(self.actor, ref, 'session:submit')  # before the fence: a stranger learns nothing
+        if ref.session_id not in self.subscriptions:
+            raise RuntimeStoreError('permission_denied')
         await self._policy_fence(ref, params)
         receipt = await self.authority.submit(self.actor, self.submission(ref, params),
                                               queue_while_restarting=self._operator is True)
@@ -864,19 +867,11 @@ class AuthorityConnection:
 
     async def _policy_fence(self, ref, params):
         """``expected_policy_revision`` on a locked session: refused unless it is the revision ``runtime_policy``
-        reports now. An unlocked session ignores it (its revision never claims completeness)."""
-        expected = params.get('expected_policy_revision')
-        if expected is None:
-            return
+        reports now (and again when the work is claimed). An unlocked session ignores it."""
         from gateway.session_policy import policy_for_source
-        from gateway.session_route_lock import is_locked, refusal
+        from gateway.session_route_lock import check_revision
         policy = policy_for_source(self.authority.runner, self.authority.sessions[ref.session_id].source)
-        if not is_locked(policy):
-            return
-        from gateway.session_config import projected_runtime_policy
-        current = (await projected_runtime_policy(self, ref, policy))['runtime_policy']['revision']
-        if expected != current:
-            raise refusal('expected_policy_revision is not the current runtime_policy.revision')
+        await check_revision(self.authority, ref, policy, params.get('expected_policy_revision'))
 
     def submission(self, ref, params):
         """The admission a ``prompt.submit``-shaped request asks for (``prompt.replace_queued`` too)."""
@@ -897,6 +892,8 @@ class AuthorityConnection:
         from gateway.session_cli_turn import submit_cli_turn_fields
         payload = {'text': params.get('text'), **admit_finite(params, submitter=(self, ref)), **submit_surface_fields(params),
                    **submit_display_fields(params), **submit_cli_turn_fields(params)}
+        if params.get('expected_policy_revision') is not None:
+            payload['expected_policy_revision'] = params['expected_policy_revision']
         if 'attachments' in params:
             payload['attachments'] = params['attachments']
         return Submission(request_id, ref, payload, 'queue')

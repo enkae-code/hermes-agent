@@ -183,6 +183,9 @@ class GatewayGoalCommandsMixin:
     async def _handle_refine_command(self, event: MessageEvent) -> str:
         """Handle /refine — run the memory/skill review fork on demand, in a daemon thread against a
         snapshot of the cached AIAgent's conversation (live session and prompt cache untouched)."""
+        from gateway.session_route_lock import locked_notice
+        if notice := locked_notice(self, event.source):
+            return notice
         args = (event.get_command_args() or "").strip()
         quick_key, agent, error = self._idle_cached_agent_or_error(event, "refine")
         snapshot = list(getattr(agent, "_session_messages", None) or [])
@@ -227,6 +230,9 @@ class GatewayGoalCommandsMixin:
         """Handle /review — spawn an independent reviewer subagent. The approval session-key
         contextvar is only bound during agent turns, so bind it explicitly here or the completion
         event carries no gateway route and never re-enters this chat."""
+        from gateway.session_route_lock import locked_notice
+        if notice := locked_notice(self, event.source):
+            return notice
         args = (event.get_command_args() or "").strip()
         quick_key, agent, error = self._idle_cached_agent_or_error(event, "review")
         snapshot = list(getattr(agent, "_session_messages", None) or [])

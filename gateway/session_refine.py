@@ -33,6 +33,8 @@ async def refine_local_session(runner, source, focus):
     policy = policy_for_source(runner, live.source)
     if policy is None:
         return None
+    from gateway.session_route_lock import refuse_if_locked
+    refuse_if_locked(policy)
     ref = SessionRef(authority.profile_id, source.chat_id)
 
     def load():

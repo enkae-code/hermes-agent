@@ -727,7 +727,8 @@ class SessionAuthority:
         self._require_admission_open(queue_only=queue_only)
         if (request.intent != 'queue' or not {'text'} <= set(request.payload) <= {
                 'text', 'attachments', 'finite', 'unattended', 'surface', 'voice_context', 'interrupted',
-                'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+                'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch',
+                'expected_policy_revision'}
                 or not isinstance(request.payload['text'], str)):
             raise RuntimeStoreError('invalid_params')
         from gateway.session_ingress_media import admit_attachments
@@ -745,6 +746,8 @@ class SessionAuthority:
         payload = {'text': request.payload['text'], **finite, **admit_surface(request.payload),
                    **admit_display(request.payload), **admit_cli_turn(request.payload),
                    **admit_attachments(request.payload.get('attachments'), admitted=admitted)}
+        if isinstance(request.payload.get('expected_policy_revision'), str):  # rechecked at claim for a locked session
+            payload['expected_policy_revision'] = request.payload['expected_policy_revision']
         if _kanban_card is not None:
             payload['kanban_card_v1'] = _kanban_card
         source = self.sessions[request.ref.session_id].source
@@ -1130,6 +1133,11 @@ class SessionAuthority:
                 else:
                     from gateway.session_operator import check_local_input
                     check_local_input(self, ref, first)
+                    from gateway.session_policy import policy_for_source
+                    from gateway.session_route_lock import check_revision
+                    # Before any prompt-bearing hook: the policy this work was admitted under must still be current.
+                    await check_revision(self, ref, policy_for_source(self.runner, live.source),
+                                         first['payload'].get('expected_policy_revision'))
                 # Editor MCP schema drift re-freezes here, at this admission's start (a turn boundary),
                 # once the head is authorized: a refused head spawns no server and commits no change.
                 from gateway.session_local_mcp import refreeze_editor_mcp
@@ -1251,6 +1259,17 @@ class SessionAuthority:
                         from gateway.session_unattended_unknown import settle_unattended_unknown
                         if await settle_unattended_unknown(self, ref):
                             continue
+                    if exc.reason == 'route_lock_mismatch':
+                        # A stale locked admission is refused on its own: the policy it was admitted under moved,
+                        # and the work behind it revalidates on its own merits (nothing was sent).
+                        head = next((row['admission_id'] for row in list_session_admissions(
+                            self.db, session_id=ref.session_id) if row['status'] == 'queued'), None)
+                        if head is not None:
+                            refusing = head, exc.reason
+                            refused = await self._refuse_head(ref, *refusing)
+                            refusing = None
+                            if refused:
+                                continue
                     if exc.reason == 'admission_conflict':
                         # A verdict on the head alone (its route or binding moved under it) that every drain
                         # repeats: pausing behind it strands the FIFO for good. Refused only once the same

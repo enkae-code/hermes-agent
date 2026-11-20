@@ -1414,6 +1414,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # The classic CLI's `/model --once` / `/moa`: this admission only, nothing persisted.
             from gateway.session_cli_turn import one_turn_route
             model, runtime_kwargs = one_turn_route(self, policy, model, runtime_kwargs)
+            from gateway.session_route_lock import verify_final
+            verify_final(policy, model, runtime_kwargs)  # a locked session runs only the route it froze
             # Another route runs (an API caller's or a one-turn override): its refusals are its own.
             pending_primary_auth = failure_for_route(pending_primary_auth, resolved_route, runtime_kwargs)
             logger.debug(

@@ -2502,6 +2502,27 @@ _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
 
+# A route-locked session's guard: ``allows(client, model)`` is true only for its one frozen endpoint and credential.
+_LOCKED_ROUTE: contextvars.ContextVar[Optional[Callable[[Any, Optional[str]], bool]]] = (
+    contextvars.ContextVar("auxiliary_locked_route", default=None)
+)
+
+
+@contextlib.contextmanager
+def locked_route(allows: Callable[[Any, Optional[str]], bool]):
+    token = _LOCKED_ROUTE.set(allows)
+    try:
+        yield
+    finally:
+        _LOCKED_ROUTE.reset(token)
+
+
+def _require_locked_route(client: Any, model: Optional[str]) -> None:
+    allows = _LOCKED_ROUTE.get()
+    if allows is not None and not allows(client, model):
+        raise AuxiliaryClientUnavailable("this session is locked to one route; the auxiliary call was not sent")
+
+
 _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_relay_call", default=None)
 )
@@ -7257,6 +7278,7 @@ def _resolve_call_client(
     if client is None:
         raise AuxiliaryClientUnavailable(f"No LLM provider configured for task={task} "
                                          f"provider={resolved_provider}. Run: hermes setup")
+    _require_locked_route(client, final_model)
     return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider)
 
 
@@ -7786,6 +7808,8 @@ def _aux_recovery_ladder(
         _failure(route, first_err), route, kwargs, max_tokens)
     if first_err is None:
         return resp
+    if _LOCKED_ROUTE.get() is not None:  # a locked route repairs its own request; it never rotates a key or walks a chain
+        raise first_err.error
     client_is_nous = (resolved_provider == "nous"
                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
     resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous, repairs)

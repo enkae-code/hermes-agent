@@ -364,8 +364,24 @@ def _runtime(provider: str, api_mode: str, base_url: Any, api_key: Any, **extra:
     if is_actual_route(provider, base_url):
         api_mode = "chat_completions"
         base_url = normalize_actual_base_url(base_url)
-    return {"provider": provider, "api_mode": api_mode, "base_url": base_url, "api_key": api_key,
-            "credential_kind": "unknown", **extra}
+    runtime = {"provider": provider, "api_mode": api_mode, "base_url": base_url, "api_key": api_key,
+               "credential_kind": "unknown", **extra}
+    if runtime["credential_kind"] == "api_key" and _is_oauth_credential(runtime):
+        runtime["credential_kind"] = "unknown"
+    return runtime
+
+
+def _is_oauth_credential(runtime: dict[str, Any]) -> bool:
+    """A credential labelled ``api_key`` that is really a subscription/OAuth token: it came from an implicit
+    OAuth env var, or on an Anthropic route its value is what the transport sends as an OAuth identity."""
+    source = str(runtime.get("source") or "").removeprefix("env:")
+    if source in _IMPLICIT_ENV_VARS or source == "ANTHROPIC_TOKEN":  # ANTHROPIC_TOKEN is the setup-token slot
+        return True
+    key = runtime.get("api_key")
+    if not isinstance(key, str) or (runtime["provider"] != "anthropic" and runtime["api_mode"] != "anthropic_messages"):
+        return False
+    from agent.anthropic_credentials import _is_oauth_token
+    return _is_oauth_token(key)
 
 
 def _cfg_provider(model_cfg: dict[str, Any]) -> str:
@@ -1261,6 +1277,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     if api_mode != runtime.get("api_mode"):
         logger.info("model.openai_runtime=codex_app_server overrides the %s runtime (source=%s); its credential/endpoint "
                     "is not used — the app-server authenticates with its own login", runtime.get("provider"), runtime.get("source"))
+    if api_mode == "codex_app_server":  # the app-server authenticates with its own login: no key was selected
+        runtime["credential_kind"] = "unknown"
     runtime["api_mode"] = api_mode
     from hermes_cli.runtime_provider_missing_key import raise_if_declared_key_missing
     raise_if_declared_key_missing(requested_provider, runtime, _get_model_config(), _FROZEN_RUNTIME_CONFIG.get(),

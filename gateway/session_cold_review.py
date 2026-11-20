@@ -19,6 +19,8 @@ async def cold_review_history(runner, source):
     """``(session_id, transcript)`` of the session ``source`` belongs to: a local session's current
     physical transcript (``gateway/session_refine.py`` reads the same one), else the messaging entry's."""
     from gateway.session_refine import _local_session
+    from gateway.session_route_lock import refuse_if_source_locked
+    refuse_if_source_locked(runner, source)  # before the stored transcript is read
     authority, live = _local_session(runner, source)
     if live is not None:
         from gateway.session_contract import SessionRef
@@ -56,6 +58,8 @@ def cold_review_parent(runner, source, session_key, session_id):
     from gateway.session_worker_construct import session_prefill, session_routing
     from run_agent import AIAgent
     policy = policy_for_source(runner, source)
+    from gateway.session_route_lock import refuse_if_locked
+    refuse_if_locked(policy)
     authority = active_authority(runner) if policy else None
     user_config = policy.config(authority, secrets=False) if policy else _load_gateway_config()
     platform_key = policy.platform if policy else _platform_config_key(source.platform)

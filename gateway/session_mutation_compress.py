@@ -40,6 +40,8 @@ async def prepare_compress(authority, live, payload, prepared):
     request = compress_request(payload)
     snapshot = prepared['snapshot']
     policy = restore_policy(snapshot['receipt']['policy'])
+    from gateway.session_route_lock import refuse_if_locked
+    refuse_if_locked(policy)  # the summary call is a second request path
     config = policy.config(authority)
     options = config.get('compression') or {}
     if options.get('checkpoint_required'):

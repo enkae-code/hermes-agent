@@ -49,6 +49,10 @@ class GatewayBackgroundMixin:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        from gateway.session_route_lock import locked_notice
+        if notice := locked_notice(self, source):  # a background agent is a second request path
+            await adapter.send(source.chat_id, notice, metadata=_thread_metadata)
+            return
 
         try:
             user_config = _load_gateway_config()

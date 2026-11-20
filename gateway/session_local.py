@@ -286,7 +286,8 @@ def _refuse_unless_static_key(authority, policy):
     except (AuthError, ValueError) as exc:
         raise RuntimeStoreError('invalid_params', field='fallback',
                                 detail='the primary route could not be resolved') from exc
-    if runtime.get('credential_kind') != 'api_key':
+    from gateway.session_route_lock import static_key
+    if not static_key(runtime):
         raise RuntimeStoreError('invalid_params', field='fallback',
                                 detail='the primary credential is not a static API key')
     from gateway.session_route_lock import freeze

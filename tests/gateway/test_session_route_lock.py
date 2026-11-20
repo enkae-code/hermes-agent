@@ -673,3 +673,29 @@ async def test_queued_work_is_checked_when_it_is_claimed_not_when_it_was_submitt
     assert [r["outcome"] for r in owner.rows(sid)][
         -1
     ] == "failed" and owner.backup.seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("override", [
+    {"model": "deepseek-pro"},
+    {"model": "deepseek-pro", "provider": "deepseek"},
+    {"model": "alt"},
+], ids=["same-provider-other-model", "explicit-provider", "alias-to-backup-endpoint"])
+async def test_a_one_turn_model_override_on_a_locked_session_sends_nothing(owner, override):
+    owner.config(model_aliases={"alt": {"model": "other-model", "provider": "custom", "base_url": owner.backup_url,
+                                        "api_key": "sk-backup-sentinel"}})
+    ref = owner.create(fallback="none")
+    await owner.call("session.resume", session_id=ref.session_id)
+    row = await owner.turn(ref, "hi", model_override=override)
+    assert _chats(owner.primary) == [] and owner.backup.seen == []
+    assert row["outcome"] != "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_profile_default_change_between_resolve_and_run_is_refused_before_dispatch(owner, monkeypatch):
+    ref = owner.create(fallback="none")
+    await owner.call("session.resume", session_id=ref.session_id)
+    from gateway.session_policy import LocalSessionPolicy
+    monkeypatch.setattr(LocalSessionPolicy, "current_model", lambda self, authority: "deepseek-pro")
+    await owner.turn(ref, "hi")
+    assert _chats(owner.primary) == [] and owner.backup.seen == []

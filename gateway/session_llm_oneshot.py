@@ -235,6 +235,9 @@ async def oneshot(connection, ref, params):
     authority = connection.authority
     if ref.session_id:
         authorize(connection, ref, params, 'session:read')
+        from gateway.session_policy import policy_for_source
+        from gateway.session_route_lock import refuse_if_locked
+        refuse_if_locked(policy_for_source(authority.runner, authority.sessions[ref.session_id].source))
         runtime = _session_runtime(authority, ref)
     else:
         from gateway.session_authorities import require_serving

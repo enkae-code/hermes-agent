@@ -189,7 +189,9 @@ class GatewaySessionAgentMixin:
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=not bool(policy and policy.ignore_rules),
             # Bot-sourced turns never see private memory (MEMORY.md/USER.md or the external provider).
-            skip_memory=bool(policy and policy.ignore_rules) or is_bot,
+            # A locked session has one request path: no external memory provider, no review fork.
+            skip_memory=bool(policy and policy.ignore_rules) or is_bot or is_locked(policy),
+            skip_background_review=is_locked(policy),
             bot_turn=is_bot,
             pass_session_id=bool(policy and policy.pass_session_id),
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
