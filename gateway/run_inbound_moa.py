@@ -26,6 +26,9 @@ class GatewayInboundMoaMixin:
             return True, moa_usage()
         preset = await default_preset()
         from gateway.session_policy import policy_for_source
+        from gateway.session_route_lock import locked_notice
+        if notice := locked_notice(self, source):  # a preset is another route
+            return True, notice
         policy = policy_for_source(self, source)
         if policy is not None:
             # A local session runs its frozen launch route and never reads the session-state override

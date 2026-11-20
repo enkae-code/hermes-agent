@@ -7,6 +7,7 @@ feature each test guards is on. Keys are fake sentinels in a disposable HERMES_H
 """
 
 import asyncio
+from contextlib import suppress
 import json
 import threading
 import time
@@ -132,8 +133,14 @@ class Owner:
         a short grace for a late stray request."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not seen_by():
-            await asyncio.sleep(0.25)
-        await asyncio.sleep(1.0)
+            await grace(0.25)
+        await grace(1.0)
+
+
+async def grace(seconds):
+    """A bounded quiet period for a stray request that must NOT arrive (polled, not slept)."""
+    with suppress(AssertionError):
+        await async_wait_until(lambda: False, timeout=seconds, what="quiet period")
 
 
 @pytest_asyncio.fixture
@@ -270,3 +277,59 @@ async def test_the_session_bound_oneshot_is_refused_on_a_locked_session(rig):
         reply = transport.frames[-1] if transport.frames else None
     assert _reason(reply) == "route_lock_mismatch", (reply, transport.frames, owner.primary.seen)
     assert owner.primary.seen == [] and owner.elsewhere == {"alt": [], "backup": []}
+
+
+@pytest.mark.parametrize("getter", ["text", "cached", "cached_async", "cache_hit", "vision", "vision_strict", "provider"])
+def test_a_direct_client_getter_is_refused_under_a_locked_route(getter, tmp_path, monkeypatch):
+    """Getters other than ``_resolve_call_client`` (kanban goal judge, compression preflight, vision probes) share
+    one guard: a locked turn gets a client for the frozen endpoint only, never any other. ``cache_hit`` is a client
+    built before the lock; ``vision_strict`` reaches a provider backend that never calls ``resolve_provider_client``."""
+    from agent import auxiliary_client as aux
+    from agent.auxiliary_route_lock import locked_route
+    from agent.auxiliary_unavailable import AuxiliaryClientUnavailable
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", ALT_KEY)
+    url = "http://127.0.0.1:9/v1"
+    task = ("openrouter", None, None, None, None) if getter == "vision_strict" else ("custom", "m", url, ALT_KEY, None)
+    monkeypatch.setattr(aux, "_resolve_task_provider_model", lambda *a, **k: task)
+    cached = lambda **k: aux._get_cached_client("custom", "m", base_url=url, api_key=ALT_KEY, **k)
+    call, at = {
+        "text": (lambda: aux.get_text_auxiliary_client("goal_judge"), 0),
+        "cached": (cached, 0),
+        "cached_async": (lambda: cached(async_mode=True), 0),
+        "cache_hit": (cached, 0),
+        "vision": (lambda: aux.resolve_vision_provider_client(provider="custom", model="m", base_url=url, api_key=ALT_KEY), 1),
+        "vision_strict": (aux.resolve_vision_provider_client, 1),
+        "provider": (lambda: aux.resolve_provider_client("custom", "m", explicit_base_url=url, explicit_api_key=ALT_KEY), 0),
+    }[getter]
+    aux._client_cache.clear()
+    if getter == "cache_hit":
+        cached()  # a client built before the lock, now served from the cache
+    with locked_route(lambda client, model: False), pytest.raises(AuxiliaryClientUnavailable):
+        call()
+    with locked_route(lambda client, model: True):
+        assert call()[at] is not None  # the same getter still serves the frozen route
+
+
+def test_a_failed_locked_call_repairs_its_request_but_never_enters_the_rotation_or_fallback_rungs(monkeypatch):
+    """The recovery ladder stops after the parameter rungs under a lock: no key rotation, no chain walk."""
+    from types import SimpleNamespace
+
+    from agent import auxiliary_client as aux
+    from agent.auxiliary_route_lock import locked_route
+
+    def boom(*a, **k):
+        raise RuntimeError("HTTP 429: quota exceeded")
+
+    client = SimpleNamespace(api_key=KEY, base_url="http://127.0.0.1:9/v1", chat=SimpleNamespace(
+        completions=SimpleNamespace(create=boom)))
+    route = aux._ResolvedAuxRoute(client, "m", "custom", "custom")
+    def walked(*a, **k):
+        raise AssertionError("a locked call entered a rotation or fallback rung")
+
+    monkeypatch.setattr(aux, "_resolve_call_client", lambda *a, **k: route)
+    for rung in ("_ladder_nous_rungs", "_ladder_credential_rungs"):
+        monkeypatch.setattr(aux, rung, walked)
+    with locked_route(lambda c, m: True), pytest.raises(RuntimeError, match="429"):
+        aux.call_llm("title_generation", messages=[{"role": "user", "content": "hi"}])

@@ -6,8 +6,11 @@ import pytest
 import pytest_asyncio
 
 from gateway.session_controls import AuthorityConnection
-from tests.gateway.test_session_route_lock import _chats, owner
+from tests.gateway import test_session_route_lock as _lock_tests
+from tests.gateway.test_session_route_lock import _chats
 from tests.waiting import async_wait_until
+
+owner = _lock_tests.owner  # the loopback-provider fixture, aliased so the tests below do not shadow an import
 
 WRONG = "0" * 16
 

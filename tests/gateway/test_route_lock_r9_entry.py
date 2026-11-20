@@ -9,13 +9,17 @@ reach the provider, so a locked pass can never be a dead path. Auto-review has i
 """
 
 import asyncio
+from contextlib import suppress
 import json
 
 import pytest
 
 from hermes_state_runtime import RuntimeStoreError
-from tests.gateway.test_session_route_lock import _chats, owner
+from tests.gateway import test_session_route_lock as _lock_tests
+from tests.gateway.test_session_route_lock import _chats
 from tests.waiting import async_wait_until
+
+owner = _lock_tests.owner  # the loopback-provider fixture, aliased so the tests below do not shadow an import
 
 REFUSAL = "route_lock_mismatch"
 
@@ -226,7 +230,8 @@ async def _review_turn(o, monkeypatch, locked):
 @pytest.mark.asyncio
 async def test_locked_turn_forks_no_review_and_syncs_no_memory(owner, monkeypatch):
     _ref, agent, syncs = await _review_turn(owner, monkeypatch, True)
-    await asyncio.sleep(6)  # the fork runs after delivery, on a thread
+    with suppress(AssertionError):  # the fork runs after delivery, on a thread: give it time to (wrongly) appear
+        await async_wait_until(lambda: _n(owner) > 1, timeout=6, what="a review fork")
     assert _n(owner) == 1, "exactly the turn request: no review fork on primary or backup"
     assert owner.backup.seen == [] and syncs == []
     assert agent.skip_background_review is True
@@ -237,3 +242,38 @@ async def test_unlocked_turn_still_forks_the_review(owner, monkeypatch):
     _ref, agent, _ = await _review_turn(owner, monkeypatch, False)
     assert agent.skip_background_review is False
     await _reached(owner, 1, "background review fork")
+
+
+# --- (6) gateway slash /btw, /compress and /moa (their own handlers, not the tui side route) -----------------
+
+
+def _slash(o, ref, text):
+    from gateway.platforms.base import MessageEvent
+
+    return MessageEvent(text=text, source=o.authority.sessions[ref.session_id].source, message_id="m-r9")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("locked", [True, False])
+@pytest.mark.parametrize("verb", ["btw", "compress"])
+async def test_gateway_slash_side_commands_follow_the_lock(owner, verb, locked):
+    ref = await _session(owner, locked)
+    if verb == "compress":
+        for i in range(6):
+            owner.authority.db.append_message(ref.session_id, "user" if i % 2 == 0 else "assistant", f"message {i}")
+    runner, base = owner.authority.runner, _n(owner)
+    reply = await getattr(runner, f"_handle_{verb}_command")(_slash(owner, ref, f"/{verb} what did I ask?"))
+    new = await _new(owner, base)
+    if locked:
+        assert "route_lock_mismatch" in reply and new == 0, (reply, new)
+    else:
+        assert "route_lock_mismatch" not in reply and new >= 1, (reply, new)
+
+
+@pytest.mark.asyncio
+async def test_gateway_slash_moa_on_a_locked_session_sends_nothing(owner):
+    ref = await _session(owner, True)
+    runner, base = owner.authority.runner, _n(owner)
+    handled, reply = await runner._hm_cmd_moa(_slash(owner, ref, "/moa hi"), owner.authority.sessions[ref.session_id].source, "k")
+    assert handled and "route_lock_mismatch" in reply, (handled, reply)
+    assert await _new(owner, base) == 0

@@ -815,6 +815,9 @@ class GatewaySessionCommandsMixin:
         from agent.conversation_compression_manual import MIN_MESSAGES, parse_compress_args
 
         source = event.source
+        from gateway.session_route_lock import locked_notice
+        if notice := locked_notice(self, source):  # the summary call is a second request path
+            return notice
         session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)

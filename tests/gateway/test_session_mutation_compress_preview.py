@@ -149,7 +149,7 @@ async def test_input_is_admitted_while_compress_summarizes_but_not_claimed_until
     monkeypatch.setattr(ContextCompressor, '__init__', lambda self, *a, **k: None)
     monkeypatch.setattr(ContextCompressor, 'compress', compress)
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
-                             _evict_cached_agent=lambda route: None,
+                             _evict_cached_agent=lambda route: None, _adapter_for_source=lambda source: None,
                              _resolve_session_agent_runtime=lambda **k: ('frozen', {}))
     authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='owner', db=db, epoch=epoch)
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)

@@ -867,6 +867,9 @@ class GatewaySlashCommandsMixin(
         if not question:
             return t("gateway.btw.usage")
         source = event.source
+        from gateway.session_route_lock import locked_notice
+        if notice := locked_notice(self, source):  # a side question is a second request path
+            return notice
         session_entry = await self.async_session_store.get_or_create_session(source)
         try:
             history = await self.async_session_store.load_transcript(session_entry.session_id)

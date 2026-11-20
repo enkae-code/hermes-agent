@@ -130,7 +130,7 @@ def aux_scope(policy):
     if not is_locked(policy):
         yield
         return
-    from agent.auxiliary_client import locked_route
+    from agent.auxiliary_route_lock import locked_route
     from hermes_cli.route_identity import normalize_route_base_url
 
     lock = json.loads(policy.route_lock_json)

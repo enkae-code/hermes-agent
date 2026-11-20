@@ -350,6 +350,21 @@ async def test_create_through_the_owner_refuses_a_non_static_key_and_makes_no_se
 
 
 @pytest.mark.asyncio
+async def test_create_through_the_real_resolver_refuses_a_jwt_and_a_cc_oauth_token(owner):
+    """A JWT-shaped ANTHROPIC_TOKEN beside a cc- CLAUDE_CODE_OAUTH_TOKEN: neither is a static key, whichever
+    the real ``resolve_runtime_provider`` picks (no resolver stub)."""
+    from hermes_state_runtime import RuntimeStoreError
+
+    owner.env(ANTHROPIC_TOKEN="eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln", CLAUDE_CODE_OAUTH_TOKEN="cc-SENTINEL-oauth")
+    owner.config(model={"provider": "anthropic", "default": "claude-sonnet-4"})
+    with pytest.raises(RuntimeStoreError) as caught:
+        owner.create(fallback="none")
+    assert (caught.value.reason, caught.value.field) == ("invalid_params", "fallback")
+    assert caught.value.detail == "the primary credential is not a static API key"  # resolved, then refused (not an AuthError)
+    assert owner.authority.sessions == {}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("change", ["key", "base_url", "credential_removed"])
 async def test_a_route_that_moved_after_create_refuses_the_turn_without_dispatch(
     owner, change, caplog

@@ -37,12 +37,14 @@ from agent.auxiliary_custom_credentials import (
     _normalize_api_key, declared_custom_credential_identity, declared_custom_key_for_base_url, fast_catalog_provider)
 from agent.errors import InvalidProviderResponseError
 from agent.auxiliary_fallback_recovery import reapply_repairs
+from agent.auxiliary_route_lock import guarded, route_is_locked
 from agent.auxiliary_managed_local import _is_managed_local_endpoint
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
 from agent.auxiliary_profile_gates import (
     PROFILE_REASONING_KEYS, contains_profile_reasoning_fields, profile_forwards_max_tokens,
 )
-from agent.auxiliary_structured_output import _route_key, _without_structured_output_format, remember_structured_output_rejection
+from agent.auxiliary_structured_output import (
+    _route_key, _translate_anthropic_response_format, _without_structured_output_format, remember_structured_output_rejection)
 from agent.codex_headers import (
     CODEX_AUX_BASE_URL as _CODEX_AUX_BASE_URL,
     apply_required_codex_headers as _apply_required_codex_headers,
@@ -1636,28 +1638,6 @@ class AsyncCodexAuxiliaryClient(_AsyncAuxiliaryClientBase):
     pass
 
 
-def _translate_anthropic_response_format(anthropic_kwargs: dict[str, Any], response_format: Any) -> None:
-    """Merge an OpenAI response format into Anthropic ``output_config``."""
-    if not isinstance(response_format, dict):
-        return
-    format_type = response_format.get("type")
-    if format_type == "json_schema":
-        json_schema = response_format.get("json_schema")
-        if not isinstance(json_schema, dict) or "schema" not in json_schema:
-            return
-        schema = json_schema["schema"]
-    elif format_type == "json_object":
-        # Anthropic SDK has no schema-less JSON mode; only ``json_schema``.
-        schema = {"type": "object"}
-    else:
-        return
-    output_config = anthropic_kwargs.get("output_config")
-    if not isinstance(output_config, dict):
-        output_config = {}
-        anthropic_kwargs["output_config"] = output_config
-    output_config["format"] = {"type": "json_schema", "schema": schema}
-
-
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -2501,27 +2481,6 @@ def _read_main_api_key_if_same_origin(aux_base_url: str) -> str | Callable[[], s
 _RUNTIME_MAIN_CONTEXT: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_runtime_main", default=None)
 )
-
-# A route-locked session's guard: ``allows(client, model)`` is true only for its one frozen endpoint and credential.
-_LOCKED_ROUTE: contextvars.ContextVar[Optional[Callable[[Any, Optional[str]], bool]]] = (
-    contextvars.ContextVar("auxiliary_locked_route", default=None)
-)
-
-
-@contextlib.contextmanager
-def locked_route(allows: Callable[[Any, Optional[str]], bool]):
-    token = _LOCKED_ROUTE.set(allows)
-    try:
-        yield
-    finally:
-        _LOCKED_ROUTE.reset(token)
-
-
-def _require_locked_route(client: Any, model: Optional[str]) -> None:
-    allows = _LOCKED_ROUTE.get()
-    if allows is not None and not allows(client, model):
-        raise AuxiliaryClientUnavailable("this session is locked to one route; the auxiliary call was not sent")
-
 
 _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("auxiliary_relay_call", default=None)
@@ -5236,6 +5195,7 @@ _EXPLICIT_PROVIDER_BRANCHES: dict[str, Callable[[_ResolveRequest], _ResolveResul
 }
 
 
+@guarded()
 def resolve_provider_client(
     provider: str, model: str | None = None, async_mode: bool = False, raw_codex: bool = False,
     explicit_base_url: str | None = None, explicit_api_key: Optional[str | Callable[[], str]] = None,
@@ -5502,6 +5462,7 @@ def _vision_auto_route(
 _ZAI_OPENAI_VISION_URLS = ("https://open.bigmodel.cn/api/paas/v4", "https://api.z.ai/api/paas/v4")
 
 
+@guarded(1)
 def resolve_vision_provider_client(
     provider: Optional[str] = None, model: Optional[str] = None, *, base_url: Optional[str] = None,
     api_key: Optional[str] = None, async_mode: bool = False,
@@ -5827,6 +5788,7 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     return model or cached_default
 
 
+@guarded()
 def _get_cached_client(
     provider: str, model: str | None = None, async_mode: bool = False, base_url: str | None = None,
     api_key: str | None = None, api_mode: str | None = None, main_runtime: Optional[dict[str, Any]] = None,
@@ -7278,7 +7240,6 @@ def _resolve_call_client(
     if client is None:
         raise AuxiliaryClientUnavailable(f"No LLM provider configured for task={task} "
                                          f"provider={resolved_provider}. Run: hermes setup")
-    _require_locked_route(client, final_model)
     return _ResolvedAuxRoute(client, final_model, resolved_provider, effective_provider)
 
 
@@ -7808,7 +7769,7 @@ def _aux_recovery_ladder(
         _failure(route, first_err), route, kwargs, max_tokens)
     if first_err is None:
         return resp
-    if _LOCKED_ROUTE.get() is not None:  # a locked route repairs its own request; it never rotates a key or walks a chain
+    if route_is_locked():  # a locked route repairs its own request; it never rotates a key or walks a chain
         raise first_err.error
     client_is_nous = (resolved_provider == "nous"
                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
