@@ -699,3 +699,11 @@ async def test_a_profile_default_change_between_resolve_and_run_is_refused_befor
     monkeypatch.setattr(LocalSessionPolicy, "current_model", lambda self, authority: "deepseek-pro")
     await owner.turn(ref, "hi")
     assert _chats(owner.primary) == [] and owner.backup.seen == []
+
+
+@pytest.mark.parametrize("extra", [{"api_mode": "codex_app_server"}, {"command": "codex"}], ids=["app-server", "external-process"])
+def test_the_lock_never_accepts_an_app_server_or_process_route_whatever_its_label(extra):
+    from gateway.session_route_lock import static_key
+
+    assert static_key({"credential_kind": "api_key", "api_mode": "chat_completions"})
+    assert not static_key({"credential_kind": "api_key", "api_mode": "chat_completions", **extra})
