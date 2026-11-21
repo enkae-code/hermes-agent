@@ -401,6 +401,91 @@ def local_receipt(db, session_id):
         raise RuntimeStoreError('storage_unavailable') from exc
 
 
+def _legacy_policy_owner(conn, row):
+    from hermes_state_local_migration import LEGACY_PREFIX
+
+    session_id, chat_id, route = row['id'], row['chat_id'], row['session_key']
+    parts = (route or '').split(':', 4)
+    local_route = len(parts) >= 3 and parts[0] == 'agent' and parts[2] == 'local'
+    route_owner = parts[4] if local_route and len(parts) == 5 else None
+    candidates = tuple(dict.fromkeys(filter(None, (session_id, chat_id, route_owner))))
+    owners = []
+    for candidate in candidates:
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + candidate,)).fetchone()
+        binding = conn.execute('SELECT 1 FROM state_meta WHERE key=?', (LEGACY_PREFIX + candidate,)).fetchone()
+        if saved is not None or binding is not None:
+            owners.append((candidate, saved))
+    origin = _receipt(row['origin_json']) or {}
+    canonical = local_route or origin.get('platform') == 'local'
+    if not owners and not canonical:
+        return None
+    if len(owners) != 1 or owners[0][1] is None:
+        raise RuntimeStoreError('storage_unavailable')
+    owner, saved = owners[0]
+    return owner, json.loads(saved[0])
+
+
+def _verified_legacy_policy(conn, row, owner, receipt):
+    from gateway.session import SessionEntry, build_session_key
+    from gateway.session_policy import restore_policy
+    from hermes_state_keys import profile_from_session_key
+    from hermes_state_local_lineage import adoptable_compression, validate_local_lineage, with_adopted_compression
+
+    route, entry = receipt['route'], SessionEntry.from_dict(receipt['entry'])
+    origin = entry.origin
+    profile = profile_from_session_key(route)
+    identity = (route, owner, receipt['principal_id'])
+    if (receipt['session_id'] != owner or entry.session_key != route or origin is None or origin.platform.value != 'local'
+            or (origin.chat_id, origin.user_id) != identity[1:] or origin.chat_type != 'dm'
+            or (origin.profile is not None and origin.profile != profile)
+            or route != build_session_key(origin, profile=profile)
+            or (row['session_key'], row['chat_id'], row['user_id']) != identity):
+        raise RuntimeStoreError('storage_unavailable')
+    routed = conn.execute("SELECT entry_json FROM gateway_routing WHERE scope='' AND session_key=?", (route,)).fetchone()
+    if routed is None:
+        raise RuntimeStoreError('storage_unavailable')
+    routed_entry = SessionEntry.from_dict(json.loads(routed[0]))
+    if (routed_entry.session_id != entry.session_id or routed_entry.session_key != route
+            or routed_entry.origin != origin):
+        raise RuntimeStoreError('storage_unavailable')
+    if (adoptable := adoptable_compression(conn, receipt)) is not None:
+        receipt = with_adopted_compression(receipt, adoptable[0])
+    tip = validate_local_lineage(conn, receipt)
+    target = conn.execute('SELECT session_key,chat_id,user_id FROM sessions WHERE id=?', (tip,)).fetchone()
+    if target is None or tuple(target) != identity or row['id'] not in receipt.get('lineage', [owner]):
+        raise RuntimeStoreError('storage_unavailable')
+    policy = restore_policy(receipt['policy'])
+    if policy.route_lock_json is None and json.loads(policy.request_json).get('fallback') == 'none':
+        raise RuntimeStoreError('storage_unavailable')
+    return policy
+
+
+def require_legacy_execution(db, session_id, *, allow_unpersisted=False):
+    """Check the selected store's persisted policy, including the compression segments a donor would move.
+
+    Only legacy live/minted keys may have no row; a surviving canonical marker still requires a receipt.
+    """
+    from gateway.session_route_lock import is_locked, refusal
+
+    if not hasattr(db, 'transcript_read_snapshot'):  # only a real SessionDB persists route locks; adaptors cannot hold one
+        return
+    with db.transcript_read_snapshot() as consistent:
+        lineage = db.get_compression_lineage(session_id) or [session_id]
+        with db._read_ctx() as conn:
+            for segment in lineage:
+                row = conn.execute('SELECT id,chat_id,session_key,user_id,origin_json FROM sessions WHERE id=?',
+                                   (segment,)).fetchone()
+                if row is None:
+                    if not allow_unpersisted or segment.startswith('local-'):
+                        raise RuntimeStoreError('storage_unavailable')
+                    row = dict(id=segment, chat_id=None, session_key=segment, user_id=None, origin_json=None)
+                owned = _legacy_policy_owner(conn, row)
+                if owned is not None and is_locked(_verified_legacy_policy(conn, row, *owned)):
+                    raise refusal('this session must run through its owning gateway')
+        if not consistent():
+            raise RuntimeStoreError('storage_unavailable')
+
+
 def end_idle_local_session(db, *, epoch, session_id, target_id, reason):
     """Stamp ``ended_at`` on *target_id* only while the logical *session_id*'s FIFO is idle.
 

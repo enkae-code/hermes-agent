@@ -91,8 +91,10 @@ class GatewayTurnHygieneMixin:
             "hygiene_failure_cooldown_seconds", hs.failure_cooldown_seconds, float, allow_zero=True,
         )
 
-    async def _hmwa_hygiene_settings(self, source, session_key):
+    async def _hmwa_hygiene_settings(self, source, session_key, *, runtime=True):
         """Resolve model/provider/context-length + hygiene knobs (fail-soft: errors keep defaults).
+
+        ``runtime=False`` stops after the config knobs: no model, provider or context-length resolution.
 
         The 0.85 threshold is deliberately HIGHER than the agent's compressor (0.50): a safety net
         for sessions that grew between turns. ``max_turn_hold_seconds`` bounds the TURN wait
@@ -108,6 +110,8 @@ class GatewayTurnHygieneMixin:
             hs.data = _load_gateway_config()
             if hs.data:
                 self._hmwa_hygiene_read_config(hs, hs.data)
+            if not runtime:
+                return hs
             configured_model, configured_provider, configured_base_url = hs.model, hs.provider, hs.base_url
 
             with suppress(Exception):
@@ -770,8 +774,14 @@ class GatewayTurnHygieneMixin:
         histories don't cause repeated truncation/context failures. Token source: the API's
         prompt_tokens from the last turn, else a char/4 estimate."""
         from gateway.run import HygieneTurnHoldExceeded
+        from gateway.session_policy import policy_for_source
+        from gateway.session_route_lock import is_locked
         if not history or len(history) < 4:
             return history
+        if is_locked(policy_for_source(self, source)):
+            logger.debug("[%s] Route-locked session: skipping session hygiene", session_key)
+            hs = await self._hmwa_hygiene_settings(source, session_key, runtime=False)
+            return self._bound_hygiene_payload(history, hs, session_entry)
 
         hs = await self._hmwa_hygiene_settings(source, session_key)
         # Hygiene can never land with compression disabled; a sub-limit transcript is the identity (#111988).

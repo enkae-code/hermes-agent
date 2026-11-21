@@ -373,22 +373,27 @@ def _create_session(rid, params: dict, *, copy_parent_history: bool = False) -> 
     history = _coerce_seed_history(params.get("messages"))
     # Branch: links back so list_sessions_rich keeps it visible and the sidebar nests it.
     parent_session_id = _str_param(params, "parent_session_id") or None
-    if copy_parent_history:
-        if not parent_session_id:
-            return _err(rid, 4008, "parent_session_id is required when copying parent history")
-        # Whole-session desktop branches must not serialize the parent's transcript
-        # through the renderer. Read the durable display projection here, where the
-        # owning state.db already lives, and keep the full copy server-side.
+    if copy_parent_history and not parent_session_id:
+        return _err(rid, 4008, "parent_session_id is required when copying parent history")
+    if parent_session_id:
+        # Route lock is checked before any parent read or seed: a locked parent's transcript
+        # must not reach a child through another route (branch copy or seeded create alike).
         with _profile_db(params) as db:
             if db is None:
                 return _db_unavailable_error(rid, code=5008)
-            try:
-                _, display_history = db.get_resume_conversations(parent_session_id)
-            except Exception as exc:
-                return _err(rid, 4008, f"nothing to branch — {exc}")
-        history = _visible_branch_history(display_history)
-        if not history:
-            return _err(rid, 4008, "send a message first")
+            if (refusal := _legacy_execution_refusal(rid, db, parent_session_id, allow_unpersisted=True)) is not None:
+                return refusal
+            if copy_parent_history:
+                # Whole-session desktop branches must not serialize the parent's transcript
+                # through the renderer. Read the durable display projection here, where the
+                # owning state.db already lives, and keep the full copy server-side.
+                try:
+                    _, display_history = db.get_resume_conversations(parent_session_id)
+                except Exception as exc:
+                    return _err(rid, 4008, f"nothing to branch — {exc}")
+                history = _visible_branch_history(display_history)
+                if not history:
+                    return _err(rid, 4008, "send a message first")
     # Only a chosen workspace persists as cwd; the launch-dir fallback is "No workspace"
     # (#108205: the desktop arm lets the client vouch for a host-invisible path, #52589 provenance).
     explicit_cwd, session_cwd, remote_cwd = _resolve_create_cwd(params, source, profile_home)
@@ -731,22 +736,36 @@ def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
                  "profile_name": profile_name_for_home(live.get("profile_home")) or _response_profile_name(ctx.profile)}}, live))
 
 
-def _resume_adopt_stranded(ctx: _Resume) -> None:
+def _legacy_execution_refusal(rid, db, session_id, *, allow_unpersisted=False) -> dict | None:
+    from hermes_state_local import require_legacy_execution
+    from hermes_state_runtime import RuntimeStoreError
+
+    try:
+        require_legacy_execution(db, session_id, allow_unpersisted=allow_unpersisted)
+    except RuntimeStoreError as exc:
+        if exc.reason == 'route_lock_mismatch':
+            return _err(rid, 4133, 'This session is route locked. Resume it through its owning gateway. (route_lock_mismatch)')
+    except Exception:
+        logger.warning('Legacy session policy could not be verified for %s', session_id, exc_info=True)
+    else:
+        return None
+    return _err(rid, 5000, 'Could not verify the stored session policy. (storage_unavailable)')
+
+
+def _resume_adopt_stranded(ctx: _Resume) -> dict | None:
     """Adopt a lineage stranded in the DEFAULT store (older builds ran a profile bot's turns on the focused
     tile's backend; unadopted it 4001s forever). Exact-id ONLY — bot titles collide; never a retired donor."""
     try:
-        # Stranded-session adoption (#93296 follow-up): before session RPCs routed by their TARGET session,
-        # a profile bot's turns executed on the focused tile's backend — usually default — so its canonical
-        # session accumulated in the DEFAULT profile's state.db. Now that routing is correct, this
-        # profile-scoped resume is the first place the fix and the stranded data collide: the id exists in
-        # the default store but not here, and without adoption the same chat 4001s forever (the fix made it
-        # unreachable instead of misrouted). Adopt the full lineage from the default store into this
-        # profile's db, then retry the lookup. Only profile-scoped resumes reach here (owns_db); unknown ids
-        # in the default store still 4007 exactly as before.
         default_db = _get_db()
         donor_row = default_db.get_session(ctx.target) if default_db is not None else None
-        if not donor_row or donor_row.get("archived"):
-            return
+    except Exception:
+        logger.warning('Could not look up the legacy donor session %s', ctx.target)
+        return _err(ctx.rid, 5000, 'Could not verify the stored session policy. (storage_unavailable)')
+    if not donor_row or donor_row.get("archived"):
+        return None
+    if (refusal := _legacy_execution_refusal(ctx.rid, default_db, donor_row['id'])) is not None:
+        return refusal
+    try:
         adoption = ctx.db.adopt_session_lineage_from(default_db, donor_row["id"])
         if adoption.get("adopted"):
             logger.info("adopted stranded session %s (lineage of %s segment(s)) from default store into profile %s",
@@ -758,6 +777,7 @@ def _resume_adopt_stranded(ctx: _Resume) -> None:
                 ctx.target = ctx.found["id"]
     except Exception:
         logger.exception("stranded-session adoption failed for %s", ctx.target)
+    return None
 
 
 def _resume_materialize_minted(ctx: _Resume) -> None:
@@ -805,11 +825,16 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         return None
     live_sid = _find_live_unpersisted(ctx.target, ctx.profile_home)
     if (live := _sessions.get(live_sid) if live_sid else None) is not None:
+        if (refusal := _legacy_execution_refusal(
+                ctx.rid, ctx.db, live.get('session_key'), allow_unpersisted=True)) is not None:
+            return refusal
         return _resume_live_unpersisted(ctx, live_sid, live)
-    if ctx.owns_db:
-        _resume_adopt_stranded(ctx)
+    if ctx.owns_db and (refusal := _resume_adopt_stranded(ctx)) is not None:
+        return refusal
     if not ctx.found and not ctx.lazy and _is_server_minted_key(ctx.target) \
             and not _any_live_session_claims_key(ctx.target):
+        if (refusal := _legacy_execution_refusal(ctx.rid, ctx.db, ctx.target, allow_unpersisted=True)) is not None:
+            return refusal
         _resume_materialize_minted(ctx)
     return None if ctx.found else _err(ctx.rid, 4007, "session not found")
 
@@ -837,11 +862,18 @@ def _resume_guard(ctx: _Resume) -> dict | None:
     omit_messages / lazy paths load the TIP segment only and are guarded tip-only (a lineage count rejected
     exactly the well-compressed chats). Metadata fallback for lightweight adaptor DBs; fails OPEN on errors.
 
-    Kanban worker transcripts refuse FIRST and fail CLOSED on a positive match (#68779): a
+    Route policy is checked before resolving and after changing the target. Kanban worker transcripts
+    also fail CLOSED on a positive match (#68779): a
     resumed Desktop/TUI session would be a write-capable writer with none of the dispatcher
     ownership env, invisible to the board while a re-dispatch can start a competing writer
     in the same workspace. One guard for every resume shape below (cold / eager / deferred /
     lazy / live-reuse) — no slash worker is ever built for a refused session."""
+    original = ctx.target
+    if (refusal := _legacy_execution_refusal(ctx.rid, ctx.db, original, allow_unpersisted=not ctx.found)) is not None:
+        return refusal
+    _resume_follow_tip(ctx)
+    if ctx.target != original and (refusal := _legacy_execution_refusal(ctx.rid, ctx.db, ctx.target)) is not None:
+        return refusal
     from hermes_cli.kanban_resume_guard import kanban_resume_refusal
     if (kanban_refusal := kanban_resume_refusal(ctx.db, ctx.target)) is not None:
         return _err(ctx.rid, 4132, kanban_refusal)
@@ -1064,7 +1096,6 @@ def _(rid, params: dict) -> dict:
             return _db_unavailable_error(rid, code=5000)
         if (resp := _resume_locate(ctx)) is not None:
             return resp
-        _resume_follow_tip(ctx)
         if (resp := _resume_guard(ctx)) is not None:
             return resp
         ctx.profile_resume_cwd = (_resumable_stored_cwd(_str_param(ctx.found, "cwd"), ctx.profile_home)

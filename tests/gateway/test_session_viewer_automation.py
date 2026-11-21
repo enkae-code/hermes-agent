@@ -175,3 +175,20 @@ async def test_a_tool_that_moves_the_goal_mid_turn_repaints_the_viewers_once(own
     await tool_completes('tests pass')
     await tool_completes()
     assert [u['control']['goal']['subgoals'] for u in updates] == [['tests pass']]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('locked', [True, False])
+async def test_a_refused_model_call_does_not_register_the_viewer_as_driver(owner, monkeypatch, locked):
+    """The viewer takes over the goal judge only after its call ran: a locked refusal must leave the gateway's drivers."""
+    from gateway import session_route_lock
+    from gateway.session_viewer_automation import viewer_driven
+    from hermes_cli import goals
+    await owner.call('goal', 'set', 'write the report')
+    monkeypatch.setattr(goals, 'judge_goal', lambda *a, **kw: ('continue', 'x', False, None, False))
+    monkeypatch.setattr(session_route_lock, 'is_locked', lambda policy: locked)
+    owner.authority.__dict__.pop('viewer_automation', None)  # the setup call above registered the viewer; start clean
+    owner.viewer.subscriptions[owner.ref.session_id] = 'sub-1'
+    reply = await owner.call('goal', 'evaluate_after_turn', 'drafted the outline')
+    assert (reply.get('message') == 'route_lock_mismatch') is locked
+    assert viewer_driven(owner.authority, owner.ref.session_id) is (not locked)

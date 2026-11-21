@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 from pathlib import Path
 
 from hermes_state_runtime import RuntimeStoreError
@@ -113,9 +114,31 @@ def _special(mgr, kind, target, call, args, kwargs):
 _NOT_SPECIAL = object()
 
 
-def invoke(runner, kind, target, call, args, kwargs) -> dict:
+def _needs_model(mgr, kind: str, call: str, args: list, kwargs: dict) -> bool:
+    """Whether this bound manager call will invoke an auxiliary model."""
+    if kind == "goal" and call == "evaluate_after_turn":
+        return True
+    if kind == "goal" and call == "command":
+        arg = str((args or [""])[0] or "").strip()
+        return (arg.split(None, 1)[:1] or [""])[0].lower() == "draft"
+    if kind == "loop" and call == "complete_tick":
+        state = mgr.state
+        if state is None or not getattr(state, "awaiting_response", False) or not getattr(state, "until", ""):
+            return False
+        bound = inspect.signature(getattr(mgr, call)).bind(*args, **kwargs)
+        last_response = str(bound.arguments.get("last_response") or "")
+        if not last_response.strip():
+            return False
+        from hermes_cli.loops import response_signals_complete
+        return not response_signals_complete(last_response)
+    return False
+
+
+def invoke(runner, kind, target, call, args, kwargs, *, before_model=None) -> dict:
     """Run one call against ``target``'s persisted state: ``{state, value}`` or ``{state, error}``."""
     mgr = _manager(runner, kind, target)
+    if before_model is not None and _needs_model(mgr, kind, call, args, kwargs):
+        before_model()
     out: dict
     try:
         value = _special(mgr, kind, target, call, args, kwargs)
@@ -150,22 +173,26 @@ async def automation(connection, ref, params):
     live = authority.sessions[ref.session_id]
     from gateway.session_ancillary import physical_target
     target = physical_target(authority, ref)
-    if not hasattr(authority, "viewer_automation"):
-        authority.viewer_automation = {}
-    authority.viewer_automation[ref.session_id] = connection
     runner = authority.runner
     home = Path(authority.profile_id)
 
     def run():
         from gateway.run import _profile_runtime_scope
         from gateway.session_commands import _session_workspace
+        from gateway.session_route_lock import refuse_if_source_locked
         with _profile_runtime_scope(home), _session_workspace(runner, live.source):
-            return invoke(runner, kind, target, call, args, kwargs)
+            return invoke(
+                runner, kind, target, call, args, kwargs,
+                before_model=lambda: refuse_if_source_locked(runner, live.source),
+            )
     rows = lambda: tuple(authority.db.get_meta(f"{k}:{target}") for k in ("goal", "loop", "heartbeat"))
     # A "read" can still write: is_waiting / goal_blocks_tick clear a satisfied goal barrier.
     before = rows() if call in _READS else None
     # The judge and gates block for seconds: off the loop, with the caller's context (profile scope).
     result = await asyncio.to_thread(run)
+    if not hasattr(authority, "viewer_automation"):
+        authority.viewer_automation = {}
+    authority.viewer_automation[ref.session_id] = connection
     if kind == "heartbeat" and call in _WATCHDOG_CALLS and (call == "due_prompt" or result.get("value") is not None):
         # The CLI's watchdog runs from these on: from then on the gateway poller leaves the ticks to it.
         if not hasattr(authority, "viewer_heartbeat"):

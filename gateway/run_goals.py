@@ -389,15 +389,18 @@ class GatewayGoalsMixin:
         # folder is gone) is no evidence either (the TUI's hook skips it the same way): the tick is
         # released with no text, so a --until judge never grades it.
         failed = self._turn_failed()
+        from gateway.session_policy import policy_for_source
+        from gateway.session_route_lock import is_locked
+        locked = is_locked(policy_for_source(self, source))
         hooks = [("loop completion", self._post_turn_loop_completion)]
-        if final_text.strip() and not failed:
+        if final_text.strip() and not failed and not locked:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
                 # Both hooks may defer a notice into this turn's post-delivery slot: each needs
                 # the turn's generation or the chained bubble cleanup loses it.
                 await hook(session_entry=session_entry, source=source,
-                           final_response="" if failed else final_text,
+                           final_response="" if (failed or locked) else final_text,
                            run_generation=turn_run_generation(event))
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)

@@ -33,7 +33,12 @@ class GatewayGoalCommandsMixin:
     async def _handle_goal_command(self, event: MessageEvent) -> str:
         from hermes_cli.goal_command import dispatch_goal_command
         from hermes_cli.goals import last_user_message_from_db
+        from gateway.session_route_lock import locked_notice
 
+        # Only /goal draft calls the aux judge model; the other verbs stay local on a locked session.
+        verb = (event.get_command_args() or "").split(None, 1)[:1]
+        if verb and verb[0].lower() == "draft" and (notice := locked_notice(self, event.source)):
+            return notice
         mgr, _session_entry = await self._get_goal_manager_for_event(event)
         if mgr is None:
             return t("gateway.goal.unavailable")

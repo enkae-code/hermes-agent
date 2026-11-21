@@ -1554,6 +1554,15 @@ class GatewayInboundMixin(
                 len(image_paths),
             )
             return message_text
+        from gateway.session_policy import policy_for_source
+        from gateway.session_route_lock import is_locked
+        if is_locked(policy_for_source(self, source)):
+            logger.debug("[%s] Route-locked session: skipping automatic image description", session_key)
+            prefix = "\n\n".join(
+                f'<image-attached path="{path}">\n[User sent an image at {path}; automatic analysis disabled for route-locked session]'
+                for path in image_paths
+            )
+            return f"{prefix}\n\n{message_text}" if message_text else prefix
         logger.info(
             "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
             _img_mode, len(image_paths),
