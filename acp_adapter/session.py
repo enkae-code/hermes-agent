@@ -134,6 +134,19 @@ def _first_user_preview(history: list[dict[str, Any]], default: str) -> str:
                  if m.get("role") == "user" and str(m.get("content") or "").strip()), default)
 
 
+def _require_unlocked(db, session_id: str, **kwargs) -> None:
+    """``require_legacy_execution`` with any failure typed: a route lock is ``route_lock_mismatch``, anything
+    else (a malformed receipt included) ``storage_unavailable`` -- never an empty history or a fresh agent."""
+    from hermes_state_local import require_legacy_execution
+    from hermes_state_runtime import RuntimeStoreError
+    try:
+        require_legacy_execution(db, session_id, **kwargs)
+    except RuntimeStoreError:
+        raise
+    except Exception as exc:  # health: allow BLE001 -- unverifiable policy: refuse
+        raise RuntimeStoreError("storage_unavailable") from exc
+
+
 @dataclass
 class SessionState:
     """Tracks per-session state for an ACP-managed Hermes agent."""
@@ -265,6 +278,7 @@ class SessionManager:
         db = self._get_db()
         if db is None:
             return None
+        _require_unlocked(db, session_id, allow_unpersisted=True)  # typed refusal, never the swallow below
         try:
             return db.get_messages_as_conversation(session_id, include_compacted=True)
         except Exception:
@@ -480,6 +494,8 @@ class SessionManager:
         except Exception:
             logger.debug("Failed to query DB for ACP session %s", session_id, exc_info=True)
             return None
+        if row is not None:  # any source: the 'acp' gate below is incidental, a locked row is refused, not "unknown"
+            _require_unlocked(db, session_id)
         if row is None or row.get("source") != "acp":
             return None
 

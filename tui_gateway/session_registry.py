@@ -338,6 +338,10 @@ def _init_session(
     sid: str, key: str, agent, history: list, cols: int = 80, cwd: str | None = None,
     session_db=None, source: str | None = None, profile_home: str | None = None,
     explicit_cwd: bool = False):
+    from hermes_state_local import require_legacy_execution
+
+    # This registry binds legacy runtimes; SessionAuthority owns canonical turns separately.
+    require_legacy_execution(session_db if session_db is not None else _get_db(), key, allow_unpersisted=True)
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {

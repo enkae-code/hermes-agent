@@ -179,15 +179,17 @@ def moved_receipts(conn, target_ids=None):
     (the stored identity check in ``gateway.session_local_recovery._checked_entry``). Only the
     current target counts: an earlier ``/new`` segment that moved leaves the conversation the
     receipt guards local, and releasing it would strand that transcript. *target_ids* narrows the
-    scan to the rows one repoint rewrote."""
+    scan to the rows one repoint rewrote, and those are returned locked or not, so the repoint's own
+    ``hand_off_conversations`` can refuse (B2). The boot scan (no *target_ids*) is a heal, never a
+    refusal: it leaves a route-locked receipt where it is."""
     rows = conn.execute(
-        "SELECT substr(m.key, ?), s.id, s.source FROM state_meta m JOIN sessions s "
+        "SELECT substr(m.key, ?), s.id, s.source, m.value FROM state_meta m JOIN sessions s "
         "ON s.id = CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END "
         "WHERE m.key GLOB ? AND s.session_key IS NOT NULL "
         "AND s.session_key IS NOT CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.route') END",
         (len(POLICY_PREFIX) + 1, POLICY_PREFIX + '*')).fetchall()
-    return {owner: (target, source) for owner, target, source in rows
-            if target_ids is None or target in target_ids}
+    return {owner: (target, source) for owner, target, source, raw in rows
+            if (target in target_ids if target_ids is not None else not _receipt_locked(raw))}
 
 
 def release_receipts(conn, owners):
@@ -207,6 +209,7 @@ def handoff_head(db, session_id):
         owner = local_lineage_owner(conn, session_id)
         saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + owner,)).fetchone()
     target = _policy_target(saved[0]) if saved else None
+    require_movable(db, (session_id, owner, target))  # before any caller writes: a handoff has no own-route case
     start = target or session_id
     return (owner if target else None), db.get_compression_tip(start) or start
 
@@ -220,7 +223,16 @@ def hand_off_conversations(conn, moved):
     ``/new`` segments take the lane's identity, so they open there as read-only history (a lane
     moved past them) instead of staying local rows no receipt restores; the conversation's name
     follows its head, which the lane continues as its own conversation. Returns the receipts it
-    handed off: one whose lineage is malformed stays as it is (its own reads refuse it, logged)."""
+    handed off: one whose lineage is malformed stays as it is (its own reads refuse it, logged).
+
+    A route-locked receipt is never retired: the whole write is refused ``route_lock_mismatch`` before
+    its first statement, so the caller's transaction (which already rewrote the row's lane identity)
+    rolls back with the receipt, the rows and the lane as they were (B2)."""
+    from gateway.session_route_lock import refusal
+    for owner in moved:
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + owner,)).fetchone()
+        if saved and _receipt_locked(saved[0]):
+            raise refusal('this session is route-locked: it must run through its owning gateway')
     handed = {}
     for owner, (target, source) in moved.items():
         saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + owner,)).fetchone()
@@ -242,6 +254,39 @@ def _receipt(raw):
     except (TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _receipt_locked(raw):
+    """Whether the stored receipt *raw* freezes a route, read from the receipt itself: a repointed row no
+    longer matches the identity ``_locked_owner`` verifies, so that cannot classify it. The same
+    predicate (``is_locked``, and ``_verified_legacy_policy``'s missing-lock case); it does not re-validate
+    the whole policy (an older receipt must still be movable). Anything it cannot read counts as locked."""
+    from types import SimpleNamespace
+
+    from gateway.session_route_lock import is_locked
+    try:
+        policy = _receipt(raw)['policy']
+        return (is_locked(SimpleNamespace(route_lock_json=policy.get('route_lock_json')))
+                or json.loads(policy['request_json']).get('fallback') == 'none')
+    except Exception:
+        return True
+
+
+def require_movable(db, session_ids, route=None):
+    """Refuse ``route_lock_mismatch`` unless every local conversation owning one of *session_ids* is
+    unlocked, or *route* is its own (a local session's own route follows its compression tip). Before any
+    write of a repoint onto a messaging lane, for the resolved owner and its lineage (B2)."""
+    if not hasattr(db, 'transcript_read_snapshot'):  # only a real SessionDB persists route locks
+        return
+    from gateway.session_route_lock import refusal
+    with db._read_ctx() as conn, content_snapshot(conn):
+        for sid in dict.fromkeys(filter(None, session_ids)):
+            owner, locked = _locked_owner(conn, sid)
+            if not locked:
+                continue
+            saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + owner,)).fetchone() if owner else None
+            if route is None or not saved or (_receipt(saved[0]) or {}).get('route') != route:
+                raise refusal('this session is route-locked: it must run through its owning gateway')
 
 
 def _segment_root(conn, segments, target):

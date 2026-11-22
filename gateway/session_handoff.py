@@ -55,6 +55,7 @@ _REFUSALS = {'unknown_platform': "unknown platform '{platform}'",
 _UNSETTLED = {'session_busy': 'wait for the current turn to finish, then retry the handoff',
               'unknown_execution': 'a turn of this session did not finish when Hermes restarted; send /discard '
                                    'in it (or resume it) first, then retry the handoff'}
+_LOCKED = 'this session is route-locked: it runs only through its owning gateway and cannot be handed off'
 
 
 def require_settled(db, session_id, conn):
@@ -62,9 +63,14 @@ def require_settled(db, session_id, conn):
     admission, a live worker, or a live turn lease on its runtime lineage. A recovered ``unknown``
     turn has no resident drain task, yet moving its route would hand the lane a turn whose outcome
     nobody resolved. Runs on the caller's write transaction: inside ``request_handoff``'s, and again
-    when the watcher repoints (``check_settled``), so a turn admitted after the request still wins."""
+    when the watcher repoints (``check_settled``), so a turn admitted after the request still wins.
+    The same transaction refuses a route-locked conversation (``route_lock_mismatch``): the repoint retires
+    the receipt that locks it, so this is the last place it can still be seen (B2)."""
+    from hermes_state_local import _locked_owner
     from hermes_state_mutation_guards import MUTATION_GUARD_REFUSALS, require_idle
     from hermes_state_runtime_workers import runtime_lineage
+    if _locked_owner(conn, session_id)[1]:
+        raise HandoffRefusal('route_lock_mismatch', _LOCKED, field='fallback')
     try:
         require_idle(db, conn, sorted(runtime_lineage(conn, session_id)))
     except MUTATION_GUARD_REFUSALS:

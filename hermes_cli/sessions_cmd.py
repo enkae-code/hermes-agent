@@ -17,6 +17,7 @@ from pathlib import Path
 from hermes_cli.cli_output import print_truncated
 from hermes_cli.sessions_cmd_browse import _relative_time, _session_browse_picker
 from hermes_state_errors import SessionActiveWriteGuardError
+from hermes_state_local import RouteLockedContent
 
 
 def get_hermes_home():
@@ -369,7 +370,44 @@ def _cmd_list(db, args):
 
 # -- export -----------------------------------------------------------------
 
+def _locked_among(db, ids):
+    """The route-locked *ids* by B1's predicate (a CLI store holds no owner grant)."""
+    if not hasattr(db, "_locked_ids"):  # an adaptor store cannot hold a route lock (as in require_legacy_execution)
+        return []
+    with db._read_ctx() as conn:
+        return sorted(db._locked_ids(conn, ids))
+
+
+def _note_skipped(locked):
+    if locked:
+        print(f"Skipped {len(locked)} route-locked session(s), not exportable: {', '.join(locked)}")
+
+
+def _candidates(db, filters):
+    """Prune-style candidates minus route-locked sessions, which no portable export carries (P3); the skip is reported."""
+    rows = db.list_prune_candidates(**filters)
+    locked = _locked_among(db, [r["id"] for r in rows])
+    _note_skipped(locked)
+    return [r for r in rows if r["id"] not in locked]
+
+
+def _refuse_locked(db, session_id) -> int | None:
+    """1 (after the error) when *session_id* or a segment of its compression lineage is route-locked."""
+    if hasattr(db, "_locked_ids") and _locked_among(db, db.get_compression_lineage(session_id) or [session_id]):
+        print(f"Error: route_lock_mismatch: session '{session_id}' is route-locked; it cannot be exported or traced.")
+        return 1
+    return None
+
+
 def _cmd_export(db, args):
+    try:
+        return _export_sessions(db, args)
+    except RouteLockedContent:  # a lock minted mid-export: B1 refused the read, so stop rather than crash
+        print("Error: route_lock_mismatch: a session became route-locked during export; export stopped.")
+        return 1
+
+
+def _export_sessions(db, args):
     from hermes_cli.session_filters import build_prune_filters
     filters = None
     if _any_filter_args(args):
@@ -381,8 +419,12 @@ def _cmd_export(db, args):
         # A backup includes protected rows; prune's keep rules must not omit them.
         filters["archived"] = None
         filters["include_pinned"] = True
-    if args.session_id and not db.resolve_session_id(args.session_id):
-        return _not_found(args.session_id)
+    if args.session_id:
+        resolved = db.resolve_session_id(args.session_id)
+        if not resolved:
+            return _not_found(args.session_id)
+        if _refuse_locked(db, resolved):  # every format, trace and --upload included, before any read or write
+            return 1
 
     def _redact(data):
         if not args.redact or data is None:
@@ -428,7 +470,7 @@ def _cmd_export(db, args):
                 return _not_found(args.session_id)
             return [data]
         if filters:
-            candidates = db.list_prune_candidates(**filters)
+            candidates = _candidates(db, filters)
             if args.dry_run:
                 return _print_dry_run_preview(candidates, filters)
             if _too_large([row["id"] for row in candidates]):
@@ -439,7 +481,10 @@ def _cmd_export(db, args):
             return 1
         if _too_large():
             return 1
-        return [_redact(s) for s in db.export_all(source=None, **projection)]
+        exported = [_redact(s) for s in db.export_all(source=None, **projection)]  # B1 already dropped locked rows
+        if hasattr(db, "_locked_ids"):
+            _note_skipped(_locked_among(db, [r["id"] for r in db._read_all("SELECT id FROM sessions")]))
+        return exported
     if getattr(args, "only", None):
         return _export_flat("only", args, _collect_sessions)
     if args.format == "trace":
@@ -507,7 +552,9 @@ def _export_trace(db, args, filters):
         if not session_id:
             print("No session found to export. Pass --session-id.")
             return 1
-    from agent.trace_upload import TraceRedactionError, build_trace_jsonl, upload_session_trace
+        if _refuse_locked(db, session_id):  # the most recent session is not exempt
+            return 1
+    from agent.trace_upload import TraceRedactionError, build_trace_jsonl, read_session_messages, upload_session_trace
     redact_trace = not getattr(args, "no_redact", False)
     if getattr(args, "upload", False):
         if not session_id:
@@ -520,14 +567,13 @@ def _export_trace(db, args, filters):
     if session_id:
         ids = [db.resolve_session_id(session_id)]
     else:
-        candidates = db.list_prune_candidates(**filters)
+        candidates = _candidates(db, filters)
         if args.dry_run:
             return _print_dry_run_preview(candidates, filters)
         ids = [row["id"] for row in candidates]
 
     def _render_trace(sid):
-        meta = db.get_session(sid) or {}
-        messages = db.get_messages_as_conversation(sid)
+        messages, meta = read_session_messages(db, sid)
         if not messages:
             return None
         return build_trace_jsonl(messages, session_id=sid, model=meta.get("model") or "", cwd="", redact=redact_trace)
@@ -590,7 +636,7 @@ def _export_markdown(db, args, filters, redact):
         print("Refusing bulk export without a filter. Pass --session-id or "
               "at least one filter (e.g. --older-than 90, --source telegram).")
         return 1
-    candidates = db.list_prune_candidates(**filters)
+    candidates = _candidates(db, filters)
     if args.dry_run:
         return _print_dry_run_preview(candidates, filters)
     exported = 0

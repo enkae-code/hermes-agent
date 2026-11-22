@@ -6,6 +6,7 @@ publication still runs from the parent's ``register()``.
 """
 
 from .method_ctx import HandlerRegistry, bind_module
+from .methods_session import _legacy_execution_refusal
 
 _registry = HandlerRegistry()
 
@@ -82,26 +83,28 @@ def _branch_source_history(db, session: dict, old_key: str) -> list:
 
 
 def _branch_live(rid, params: dict, session: dict, *, omit_messages: bool = False) -> dict:
-    # Idempotency (#65410, same registry as session.create): a client retrying a
-    # branch whose first response was lost gets the SAME child, not a duplicate.
-    idem_key = _str_param(params, "idempotency_key") or None
-    if idem_key is not None:
-        with _sessions_lock:
-            now_gc = time.time()
-            existing_sid, ts = _idempotency_keys.get(idem_key, (None, 0.0))
-            if existing_sid is not None and existing_sid in _sessions:
-                if now_gc - ts <= _IDEMPOTENCY_KEY_TTL:
-                    # Refresh the TTL so back-to-back retries don't age out mid-flight.
-                    _idempotency_keys[idem_key] = (existing_sid, now_gc)
-                    return _ok(rid, _branch_idempotent_hit(existing_sid, _sessions[existing_sid], omit_messages))
-                _idempotency_keys.pop(idem_key, None)
-            # Stale key (child closed) or first attempt: fall through to a fresh
-            # branch, which re-registers the key below.
     # Write into the parent's profile-scoped state.db; the launch handle would orphan rows.
     with _session_db(session) as db:
         if db is None:
             return _db_unavailable_error(rid, code=5008)
         old_key = session["session_key"]
+        if (refusal := _legacy_execution_refusal(rid, db, old_key, allow_unpersisted=True)) is not None:
+            return refusal
+        # Idempotency (#65410, same registry as session.create): a client retrying a
+        # branch whose first response was lost gets the SAME child, not a duplicate.
+        idem_key = _str_param(params, "idempotency_key") or None
+        if idem_key is not None:
+            with _sessions_lock:
+                now_gc = time.time()
+                existing_sid, ts = _idempotency_keys.get(idem_key, (None, 0.0))
+                if existing_sid is not None and existing_sid in _sessions:
+                    if now_gc - ts <= _IDEMPOTENCY_KEY_TTL:
+                        # Refresh the TTL so back-to-back retries don't age out mid-flight.
+                        _idempotency_keys[idem_key] = (existing_sid, now_gc)
+                        return _ok(rid, _branch_idempotent_hit(existing_sid, _sessions[existing_sid], omit_messages))
+                    _idempotency_keys.pop(idem_key, None)
+                # Stale key (child closed) or first attempt: fall through to a fresh
+                # branch, which re-registers the key below.
         history = _branch_source_history(db, session, old_key)
         if not history:
             return _err(rid, 4008, "nothing to branch — send a message first")

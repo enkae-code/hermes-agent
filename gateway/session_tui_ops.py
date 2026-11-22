@@ -231,6 +231,11 @@ async def rollback(connection, ref, params, *, kind):
         raise RuntimeStoreError('session_busy')
     from gateway.session_ancillary import physical_target
     task_id = physical_target(authority, ref)
+    if kind == 'restore' and not file_path:
+        # The history rewind below is refused for a route-locked session (B1's content default-deny), and a
+        # refusal after the working tree was restored is still a mutation: refuse before ``mgr.restore``.
+        from hermes_state_local import require_content
+        await asyncio.to_thread(require_content, authority.db, task_id)
     from gateway.run import _checkpoint_agent_kwargs
     kwargs = _checkpoint_agent_kwargs(policy.config(authority, secrets=False))
     terminal = json.loads(policy.terminal_json)

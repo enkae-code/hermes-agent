@@ -192,6 +192,21 @@ async def settled_handoff_db(runner, authority, session_id):
     await check_settled(db, session_id)
 
 
+LOCKED_MOVE_NOTICE = ("This session is route-locked: it runs only through its owning gateway, so it was not moved "
+                      "onto this chat. (route_lock_mismatch)")
+
+
+async def refuse_locked_move(runner, authority, session_id, route):
+    """Raise ``route_lock_mismatch`` before ``/resume`` or reply routing releases, ends or writes anything:
+    a locked conversation never moves onto another lane (``hermes_state_local.require_movable``, the check
+    ``SessionStore.switch_session`` repeats at the one chokepoint every repoint passes)."""
+    import asyncio
+    from hermes_state_local import require_movable
+    db = authority.db if authority is not None else getattr(runner._session_db, '_db', runner._session_db)
+    if db is not None:
+        await asyncio.to_thread(require_movable, db, (session_id,), route)
+
+
 def follow_hand_off(authority, source, route, owner, local_owner):
     """After ``/handoff`` repointed *route* at *owner* (the lane's logical id of the conversation's
     head): the local mount a viewer still holds (*local_owner*, the Desktop that ran it) moves onto

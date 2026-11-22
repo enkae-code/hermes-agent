@@ -25,9 +25,9 @@ from hermes_state_local import (
 from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
 
 
-def _record(db, tmp_path, name, *, lock=True, descendant=False):
+def _record(db, tmp_path, name, *, lock=True, descendant=False, legacy=False):
     profile, principal, request = str(tmp_path / name), 'local:test', f'create-{name}'
-    owner = local_identity(profile, principal, request)
+    owner = f'legacy-{name}' if legacy else local_identity(profile, principal, request)
     route = f'agent:main:local:dm:{owner}'
     origin = dict(platform='local', chat_id=owner, chat_type='dm', user_id=principal)
     policy_lock = json.dumps(dict.fromkeys((*FIELDS, 'salt', 'credential_id'), 'test')) if lock else None
@@ -38,6 +38,9 @@ def _record(db, tmp_path, name, *, lock=True, descendant=False):
                    policy=asdict(policy), entry=dict(session_id=owner, session_key=route, origin=origin,
                                                      created_at='2026-11-21T00:00:00+00:00',
                                                      updated_at='2026-11-21T00:00:00+00:00'))
+    if legacy:
+        db.create_session(owner, source='tui')
+        receipt['legacy_session_id'] = owner
     db._b1_epoch = begin_runtime_epoch(db, instance_id='test')
     commit_local_session(db, epoch=db._b1_epoch, receipt=receipt)
     db.append_message(owner, role='user', content=f'secret-{name}')
@@ -55,6 +58,17 @@ def _record(db, tmp_path, name, *, lock=True, descendant=False):
 def db(tmp_path):
     with SessionDB(tmp_path / 'state.db') as store:
         yield store
+
+
+@pytest.mark.parametrize('locked', [False, True])
+def test_legacy_bound_content_boundary(db, tmp_path, locked):
+    sid, _ = _record(db, tmp_path, 'adopted', lock=locked, legacy=True)
+    assert content_readable(db, sid) == (not locked)
+    if locked:
+        with pytest.raises(RouteLockedContent):
+            db.get_messages(sid)
+    else:
+        assert db.get_messages(sid)[-1]['content'] == 'reply-adopted'
 
 
 def _first_id(db, sid):
@@ -367,3 +381,40 @@ def test_grant_reads_reset_then_compression_chain_and_stays_scoped(db, tmp_path)
         for sid in (owner_b, child_b):
             with pytest.raises(RouteLockedContent):
                 db.get_messages(sid)
+
+
+def test_roster_preview_redacts_locked_session(db, tmp_path):
+    from gateway.session_group_controls import _read_bot_sessions
+
+    opened, _ = _record(db, tmp_path, 'open', lock=False)
+    locked, _ = _record(db, tmp_path, 'locked')
+    _titled(db, locked, 'Bot Chat')
+    db.append_message(locked, role='user', content='locked roster message')
+    result = _read_bot_sessions(db, 'local:test', False)
+    assert result['last_session']['id'] == opened
+    assert result['last_session']['preview'] == 'reply-open'
+    assert result['canonical_session']['preview'] == ''
+
+
+def test_insights_drops_locked_tool_details(db, tmp_path):
+    from agent.insights import InsightsEngine
+
+    for name, lock in [('locked', True), ('open', False)]:
+        sid, _ = _record(db, tmp_path, name, lock=lock)
+        db.append_message(sid, role='tool', content='result', tool_name=f'{name}_tool')
+    result = json.dumps(InsightsEngine(db).generate(days=365))
+    assert 'open_tool' in result
+    assert 'locked_tool' not in result
+
+
+def test_approvals_scan_drops_locked_commands(db, tmp_path):
+    from hermes_cli.approvals_suggest import scan_approval_history
+
+    for name, lock in [('locked', True), ('open', False)]:
+        sid, _ = _record(db, tmp_path, name, lock=lock)
+        db.append_message(sid, role='assistant', content='', tool_calls=[{
+            'id': name, 'type': 'function', 'function': {
+                'name': 'terminal', 'arguments': json.dumps({'command': f'chmod -R 777 /example/{name}'})},
+        }])
+    result = [command for command, _ in scan_approval_history(db.db_path, 0)]
+    assert result == ['chmod -R 777 /example/open']

@@ -188,10 +188,16 @@ class InsightsEngine:
 
     def _query(self, base: str, cutoff: float, source: Optional[str]) -> list:
         """Rows of ``<base>_WITH_SOURCE`` or ``<base>_ALL`` (instance attrs, so the unpinned fallback applies)."""
-        if not source:
-            return self._conn.execute(getattr(self, base + "_ALL"), (cutoff,)).fetchall()
-        params = (cutoff, source, source) if self._local_surfaces else (cutoff, source)
-        return self._conn.execute(getattr(self, base + "_WITH_SOURCE"), params).fetchall()
+        from hermes_state_local import content_sql_filter
+
+        sql = getattr(self, base + ("_WITH_SOURCE" if source else "_ALL"))
+        sid = "id" if base == "_GET_SESSIONS" else "s.id"
+        sql = sql.replace("started_at >= ?", f"started_at >= ? AND route_content_readable({sid})", 1)
+        params = (cutoff,)
+        if source:
+            params += (source, source) if self._local_surfaces else (source,)
+        with content_sql_filter(self.db, self._conn):
+            return self._conn.execute(sql, params).fetchall()
 
     def generate(self, days: int = 30, source: str | None = None) -> dict[str, Any]:
         """Generate a complete insights report for the last ``days`` days, optionally filtered by source platform."""

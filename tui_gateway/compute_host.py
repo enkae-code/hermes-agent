@@ -345,6 +345,9 @@ class ComputeHost:
 
     def _build_server_session(self, server: Any, frame: dict[str, Any], sid: str) -> dict:
         """Build the agent under the frame's profile scope and register the session."""
+        from hermes_state_local import require_legacy_execution
+        from hermes_state_runtime import RuntimeStoreError
+
         key = str(frame.get("session_key") or sid)
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
         profile_home = str(frame.get("profile_home") or "")
@@ -369,6 +372,8 @@ class ComputeHost:
                 # it. A RAISING _make_agent is the one path where nothing takes it (``owns_db``).
                 session_db = acquire(Path(profile_home) / "state.db")
                 owns_db = True
+            require_legacy_execution(session_db if session_db is not None else server._get_db(),
+                                     key, allow_unpersisted=True)
             agent = server._make_agent(
                 sid, key, session_id=key, model_override=frame.get("model_override"),
                 reasoning_config_override=frame.get("reasoning_config_override"),
@@ -401,6 +406,8 @@ class ComputeHost:
                     source=frame.get("source"), explicit_cwd=bool(frame.get("explicit_cwd")))
             finally:
                 reset_transport(token)
+        except RuntimeStoreError:
+            raise
         except Exception:
             # _init_session's side machinery (slash worker, approval notify) unavailable: keep a
             # minimal host-owned session rather than failing after the expensive agent build.

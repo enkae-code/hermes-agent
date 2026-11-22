@@ -1192,7 +1192,14 @@ class GatewaySessionCommandsMixin:
         as the last await before the move — the /handoff watcher's own pattern, where an admission
         later than the fence wins by queueing. *busy_guard* then runs synchronously, with no await
         before the release, so a turn admitted during the awaits above is never released."""
-        from gateway.session_route_recovery import follow_hand_off
+        from gateway.session_route_recovery import LOCKED_MOVE_NOTICE, follow_hand_off, refuse_locked_move
+        from hermes_state_runtime import RuntimeStoreError
+        try:  # first: nothing below (release, end, write) may run for a conversation that must not move
+            await refuse_locked_move(self, authority, target_id, session_key)
+        except RuntimeStoreError as exc:
+            if exc.reason != 'route_lock_mismatch':
+                raise
+            return LOCKED_MOVE_NOTICE, 0, None, False
         conflict = await self._telegram_topic_switch_conflict(source, target_id)
         if conflict is not None:
             return conflict, 0, None, False
@@ -1332,8 +1339,14 @@ class GatewaySessionCommandsMixin:
         target_id, name = resolved
         # A local conversation moves onto this lane from its current head, as /handoff carries it: a
         # title naming its first segment (a local /new moved on) would strand the live one (#143286).
-        from gateway.session_route_recovery import conversation_head
-        authority, local_owner, head = await conversation_head(self, target_id)
+        from gateway.session_route_recovery import LOCKED_MOVE_NOTICE, conversation_head
+        from hermes_state_runtime import RuntimeStoreError
+        try:
+            authority, local_owner, head = await conversation_head(self, target_id)
+        except RuntimeStoreError as exc:  # a route-locked conversation: refused before any state moves
+            if exc.reason != 'route_lock_mismatch':
+                raise
+            return LOCKED_MOVE_NOTICE
         if local_owner is not None:
             target_id = head
         denied = await self._resume_access_denied_reply(source, target_id, name, allow_all, allow_cross_room)

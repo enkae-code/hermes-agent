@@ -219,3 +219,106 @@ def test_seeded_create_with_parent_respects_route_lock(stores, tmp_path, monkeyp
     else:
         assert 'result' in resp, resp
         assert _children(selected, parent) == 1
+
+
+def test_locked_live_legacy_branch_refuses_before_copy(stores, tmp_path, monkeypatch):
+    import threading
+
+    _, db = stores
+    parent = _record(db, tmp_path, 'locked')
+    history = [{'role': 'user', 'content': 'live history'}]
+    db.append_message(parent, 'user', 'stored history')
+    saved = [tuple(row) for row in db._read_all('SELECT * FROM messages WHERE session_id=?', (parent,))]
+    built = []
+
+    def build(*args, **kwargs):
+        built.append(args)
+        raise AssertionError('unexpected branch agent construction')
+
+    monkeypatch.setattr(server, '_make_agent_in_context', build)
+    result = _wire(monkeypatch, db, 'session.branch', {'session_id': 'live1'}, live={
+        'live1': {'session_key': parent, 'history': history, 'history_lock': threading.Lock(),
+                  'profile_home': None, 'agent': SimpleNamespace(_session_db=db)},
+    })
+    assert result['error']['code'] == 4133, result
+    assert _children(db, parent) == 0
+    assert local_receipt(db, parent)
+    assert not built
+    assert saved == [tuple(row) for row in db._read_all('SELECT * FROM messages WHERE session_id=?', (parent,))]
+
+
+@pytest.mark.parametrize(('method', 'params'), [
+    ('session.compress', {}),
+    ('session.undo', {}),
+    ('slash.exec', {'command': '/refine'}),
+    ('prompt.background', {'text': 'side task'}),
+    ('prompt.btw', {'text': 'side question'}),
+])
+def test_locked_legacy_binding_blocks_side_operations(stores, tmp_path, monkeypatch, method, params):
+    from hermes_state_runtime import RuntimeStoreError
+
+    _, db = stores
+    sid = _record(db, tmp_path, 'locked')
+    db.append_message(sid, 'user', 'stored history')
+    before = '\n'.join(db._conn.iterdump())
+    monkeypatch.setattr(server, '_sessions', {})
+
+    with pytest.raises(RuntimeStoreError) as denied:
+        server._init_session('live1', sid, None, [], session_db=db, cwd=str(tmp_path))
+    assert denied.value.reason == 'route_lock_mismatch'
+    assert not server._sessions
+    result = server.handle_request({'id': 'rl', 'method': method, 'params': {'session_id': 'live1', **params}})
+    assert result['error']['code'] == 4001, result  # No usable runtime id was ever issued.
+    assert '\n'.join(db._conn.iterdump()) == before
+
+
+def test_unlocked_legacy_binding_keeps_undo_available(stores, tmp_path, monkeypatch):
+    _, db = stores
+    sid = _record(db, tmp_path, 'unlocked')
+    monkeypatch.setattr(server, '_sessions', {})
+    monkeypatch.setattr(server, '_start_session_services', lambda *_: None)
+    server._init_session('live1', sid, None, [], session_db=db, cwd=str(tmp_path))
+    result = server.handle_request({'id': 'rl', 'method': 'session.undo', 'params': {'session_id': 'live1'}})
+    assert 'result' in result, result
+
+
+@pytest.mark.parametrize('case', ['locked', 'unlocked', 'locked_during_build'])
+def test_compute_host_legacy_binding(stores, tmp_path, monkeypatch, case):
+    from io import StringIO
+
+    from hermes_state_runtime import RuntimeStoreError
+    from tui_gateway.compute_host import ComputeHost
+
+    donor, db = stores
+    key = _record(db, tmp_path, 'locked' if case == 'locked' else 'unlocked')
+    calls = []
+    agent = SimpleNamespace()
+    monkeypatch.setattr(server, '_get_db', lambda: db)
+    monkeypatch.setattr(server, '_sessions', {})
+    monkeypatch.setattr(server, '_start_session_services', lambda *_: None)
+
+    def make_agent(*args, **kwargs):
+        calls.append(args)
+        if case == 'locked_during_build':
+            # Change the real receipt between preflight and registry admission.
+            _record(donor, tmp_path, 'locked')
+            db._write_sql('UPDATE state_meta SET value=? WHERE key=?',
+                          (json.dumps(local_receipt(donor, key)), POLICY_PREFIX + key))
+        return agent
+
+    monkeypatch.setattr(server, '_make_agent', make_agent)
+    host = ComputeHost(stdout=StringIO(), heartbeat_secs=0)
+    frame = {'sid': 'live1', 'session_key': key, 'cwd': str(tmp_path)}
+    try:
+        if case == 'unlocked':
+            live = host._ensure_server_session(server, frame)
+            assert live is server._sessions['live1']
+            assert live['agent'] is agent
+        else:
+            with pytest.raises(RuntimeStoreError) as denied:
+                host._ensure_server_session(server, frame)
+            assert denied.value.reason == 'route_lock_mismatch'
+            assert not server._sessions
+        assert len(calls) == (0 if case == 'locked' else 1)
+    finally:
+        host.close()

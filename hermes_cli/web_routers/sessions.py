@@ -30,6 +30,7 @@ from hermes_cli.web_routers._common import (
 from hermes_state import is_malformed_db_error
 from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
 from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
+from hermes_state_local import RouteLockedContent, require_content
 
 list_router = APIRouter()
 search_router = APIRouter()
@@ -141,6 +142,8 @@ def _with_db(profile: Optional[str], fn: Callable, *, read_only: bool):
         db = _open_session_db_for_profile(profile, read_only=read_only)
         try:
             return fn(db)
+        except RouteLockedContent as exc:  # B1 denied a locked session's content: one clean refusal for every route here
+            raise HTTPException(status_code=409, detail={"code": exc.reason, "message": exc.detail}) from exc
         finally:
             db.close()
     if read_only:
@@ -950,6 +953,8 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
     """Stream a single session (metadata + messages) as JSON."""
     def _prepare_export(db):
         sid = _resolve_session_id(db, session_id)
+        if sid:  # before the 200 and the stream: a refusal can't be a truncated body (P3)
+            require_content(db, sid, allow_grant=False)
         return (sid, db.get_session(sid)) if sid else None
 
     prepared = await asyncio.to_thread(_with_db, profile, _prepare_export, read_only=True)

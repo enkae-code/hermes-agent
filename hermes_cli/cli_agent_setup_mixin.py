@@ -110,6 +110,32 @@ def _compression_descendant(session_db, session_id):
     return resolved_id if resolved_id and resolved_id != session_id else None
 
 
+def _route_lock_refusal(session_db, session_id, *, allow_unpersisted=False):
+    """Why the stored conversation *session_id* may not become this CLI's history or be copied (None if it may).
+
+    One fence for classic resume, ``/resume`` and ``/branch``: the persisted route lock of the whole compression
+    lineage, via the store's own ``require_legacy_execution`` (same predicate as the TUI and ACP fences). It runs
+    before any read, gateway call or write, and a receipt that cannot be verified refuses too, so a locked id never
+    degrades to an empty history, a fresh session or a same-id turn on the CLI's own route."""
+    from hermes_cli.gateway_session_store import GatewaySessionStore
+    from hermes_state_local import require_legacy_execution
+    from hermes_state_runtime import RuntimeStoreError
+    db = session_db._db() if isinstance(session_db, GatewaySessionStore) else session_db  # the viewer's reader
+    if db is None:  # no state.db yet: nothing is stored to read
+        return None
+    try:
+        require_legacy_execution(db, session_id, allow_unpersisted=allow_unpersisted)
+    except RuntimeStoreError as exc:
+        reason = exc.reason
+    except Exception:  # health: allow BLE001 -- a malformed receipt (JSON error) is unverifiable: refuse, as the TUI fence does
+        reason = "storage_unavailable"
+    else:
+        return None
+    if reason == "route_lock_mismatch":
+        return "This session is route-locked (route_lock_mismatch): it can only run through its owning gateway."
+    return f"Cannot verify this session's route lock ({reason}); refusing to open it."
+
+
 def _gateway_owned_id(session_db, session_id):
     """The id the gateway answers for physical row *session_id*: ``session.resume``'s
     ``stored_session_id``. A canonical local compression segment holds the transcript, but its creation
@@ -601,6 +627,11 @@ class CLIAgentSetupMixin:
                 _cprint(f"\033[1;31m{not_found}{_RST}")
                 _cprint(f"{_DIM}{hint}{_RST}")
             return False
+        if (locked := _route_lock_refusal(self._session_db, self.session_id)):  # before the chain's gateway attach
+            self._resume_history_error = locked
+            _say(t("cli.resume.cannot_resume", error=locked),
+                 f"[bold red]{_escape(t('cli.resume.cannot_resume_prefix'))}[/] {_escape(locked)}")
+            return False
         session_meta = self._follow_compression_chain(
             session_meta,
             lambda rid: ChatConsole().print(
@@ -824,6 +855,10 @@ class CLIAgentSetupMixin:
         if not session_meta:
             self._console_print(f"[bold red]{_escape(t('cli.resume.session_not_found', session_id=self.session_id))}[/]")
             self._console_print(f"[dim]{_escape(t('cli.resume.session_id_hint'))}[/]")
+            return False
+        if (locked := _route_lock_refusal(self._session_db, self.session_id)):  # before the chain's gateway attach
+            self._resume_history_error = locked
+            self._console_print(f"[bold red]{_escape(t('cli.resume.cannot_resume_prefix'))}[/] {_escape(locked)}")
             return False
         session_meta = self._follow_compression_chain(
             session_meta,

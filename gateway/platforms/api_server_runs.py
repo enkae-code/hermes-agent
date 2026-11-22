@@ -838,6 +838,10 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     # is what the next same-id run consumes below.
     if selected_session_id:
         selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+        # Route-lock fence for the session the run would write to, whatever history the caller sent.
+        if (refused := await self._route_lock_refusal(str(selected_session_id))) is not None:
+            self._run_owners.pop(run_id, None)
+            return refused
     session_id = selected_session_id or run_id
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next

@@ -319,12 +319,19 @@ def _discovery_entry(lineage_root: Optional[str], **fields) -> dict[str, Any]:
     return entry
 
 
+def _recall_readable(db, sid):
+    from hermes_state import SessionDB
+    from hermes_state_local import content_readable
+
+    return not isinstance(db, SessionDB) or content_readable(db, sid, allow_grant=False)
+
+
 def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> Optional[dict[str, Any]]:
     """Discovery-shaped result when the query matches a session title, else None."""
     title_query = query.strip().strip("`'\"")  # models often quote a remembered title
     session_id = title_query and _quiet(lambda: db.resolve_session_by_title(title_query), None,
                                         "resolve_session_by_title failed for %r", title_query)
-    if not session_id:
+    if not session_id or not _recall_readable(db, session_id):
         return None
     lineage_root = _resolve_lineage(db, session_id)
     # Same-lineage title hits are in-context only while the session is live;
@@ -653,7 +660,8 @@ def _list_recent_sessions(db, limit: int, current_session_id: str | None = None,
             **{k: s.get(k, "") for k in ("source", "started_at", "last_active")},
             "message_count": s.get("message_count", 0),
             "preview": _derived_preview(s.get("preview"))}
-            for s in [x for x in sessions if x.get("id", "") not in hidden][:limit]]
+            for s in [x for x in sessions if x.get("id", "") not in hidden
+                      and _recall_readable(db, x["id"])][:limit]]
         return _ok(mode="browse", results=results, count=len(results), message=(
             f"Showing {len(results)} most recent sessions. Pass a query= to search, "
             "or session_id+around_message_id to scroll."))
@@ -731,6 +739,13 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               after=None, before=None, exclude_session_ids=None) -> str:
     """Mode dispatch (see module docstring); scroll wins when an anchor is set."""
     if isinstance(session_id, str) and session_id.strip():
+        from hermes_state_runtime import RuntimeStoreError
+
+        try:
+            if not _recall_readable(db, session_id.strip()):
+                return tool_error("session not available", success=False)
+        except RuntimeStoreError:
+            return tool_error("session storage unavailable", success=False)
         if around_message_id is not None:
             return _scroll(db, session_id.strip(), around_message_id, window, current_session_id)
         return _read_scoped(db, session_id.strip(), profile)

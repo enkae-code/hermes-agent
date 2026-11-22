@@ -113,11 +113,11 @@ def _json_or_none(raw):
         return None
 
 
-def _iter_terminal_calls(con: sqlite3.Connection, since_ts: float) -> Iterator[tuple[str, str]]:
+def _iter_terminal_calls(con: sqlite3.Connection, since_ts: float, visible: str) -> Iterator[tuple[str, str]]:
     """Yield ``(tool_call_id, command)`` for every terminal tool call."""
     cur = con.execute(
         "SELECT tool_calls FROM messages WHERE role='assistant' AND tool_calls IS NOT NULL "
-        "AND tool_calls LIKE '%terminal%' AND timestamp >= ?",
+        "AND tool_calls LIKE '%terminal%' AND timestamp >= ?" + visible,
         (since_ts,),
     )
     for (raw,) in _fetch_rows(cur):
@@ -134,12 +134,12 @@ def _iter_terminal_calls(con: sqlite3.Connection, since_ts: float) -> Iterator[t
                 yield (call.get("id") or "", command)
 
 
-def _blocked_tool_call_ids(con: sqlite3.Connection, since_ts: float) -> set:
+def _blocked_tool_call_ids(con: sqlite3.Connection, since_ts: float, visible: str) -> set:
     """Collect tool_call_ids whose result shows the command never ran freely."""
     cur = con.execute(
         "SELECT tool_call_id, content FROM messages "
         "WHERE role='tool' AND tool_call_id IS NOT NULL AND timestamp >= ? "
-        "AND (content LIKE '%BLOCKED%' OR content LIKE '%approval%')",
+        "AND (content LIKE '%BLOCKED%' OR content LIKE '%approval%')" + visible,
         (since_ts,),
     )
     return {
@@ -161,10 +161,16 @@ def scan_approval_history(db_path: Optional[Path] = None, days: int = 90) -> lis
     since_ts = 0.0 if days <= 0 else time.time() - days * 86400
 
     records: list[tuple[str, str]] = []
-    con = _connect_readonly(path)
-    try:
-        blocked = _blocked_tool_call_ids(con, since_ts)
-        for tool_call_id, command in _iter_terminal_calls(con, since_ts):
+    from contextlib import closing
+    from hermes_state_local import content_sql_filter
+
+    with closing(_connect_readonly(path)) as con, content_sql_filter(None, con):
+        con.row_factory = sqlite3.Row
+        # Old message-only imports cannot contain a route receipt.
+        canonical = con.execute("SELECT 1 FROM sqlite_master WHERE name='sessions' AND type='table'").fetchone()
+        visible = " AND route_content_readable(session_id)" if canonical else ""
+        blocked = _blocked_tool_call_ids(con, since_ts, visible)
+        for tool_call_id, command in _iter_terminal_calls(con, since_ts, visible):
             if tool_call_id in blocked:
                 continue
             # Hardline commands are unconditionally blocked at runtime; never mine them (defense in
@@ -175,8 +181,6 @@ def scan_approval_history(db_path: Optional[Path] = None, days: int = 90) -> lis
             is_dangerous, _key, description = detect_dangerous_command(command)
             if is_dangerous:
                 records.append((command, description))
-    finally:
-        con.close()
     return records
 
 

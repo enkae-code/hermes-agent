@@ -1363,6 +1363,11 @@ class SessionStore(
         Prompt pins follow non-boundary repoints by default; /resume opts out explicitly because it
         starts a different conversation on the same routing key.
         """
+        if db := self._db_for_key(session_key):
+            # Before the route lock, the old row's end or any write: a locked conversation never moves onto
+            # another lane (a handoff or /resume retires the receipt that locks it, so nothing could re-check).
+            from hermes_state_local import require_movable
+            require_movable(db, (target_session_id,), session_key)
         with self._lock:
             old_entry = self._entry_locked(session_key)
             refused = old_entry is None or (

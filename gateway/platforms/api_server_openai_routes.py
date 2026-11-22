@@ -17,6 +17,7 @@ from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from agent.i18n import t
+from hermes_state_runtime import RuntimeStoreError
 
 try:
     from aiohttp import web
@@ -924,7 +925,10 @@ class OpenAICompatRoutesMixin:
                     # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
                     from gateway.platforms.api_server_runs import _resolve_live_session_id
                     session_id = await _resolve_live_session_id(self, provided_session_id)
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+                    history = await self._conversation_history_for_session(session_id)  # route-lock fence
+            except RuntimeStoreError as exc:  # locked/unverifiable: refuse, never an empty-history turn
+                from gateway.platforms.api_server_authority_runs import store_error_response
+                return store_error_response(_openai_error, exc)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
@@ -1410,6 +1414,8 @@ class OpenAICompatRoutesMixin:
         if error is not None:
             return error
         session_id, user_message = context['session_id'], context['user_message']
+        if (refused := await self._route_lock_refusal(session_id)) is not None:  # before any provider work
+            return refused
         conversation_history, instructions = context['conversation_history'], context['instructions']
         run_kwargs, run_agent = context['run_kwargs'], context['run_agent']
         response_store = self._current_response_store()

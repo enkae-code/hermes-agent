@@ -1,10 +1,14 @@
 """Regression for #139227: adopted local chats stay visible in the bot roster."""
+import json
+from dataclasses import asdict
 from types import SimpleNamespace
 
 from gateway.session_contract import SessionActor
 from gateway.session_group_controls import _profiles
+from gateway.session_policy import LocalSessionPolicy
 from hermes_state import SessionDB
-from hermes_state_local_migration import bind_legacy_target
+from hermes_state_local import commit_local_session
+from hermes_state_runtime import begin_runtime_epoch
 
 
 def test_adopted_hidden_bot_chat_is_canonical_but_not_recent(tmp_path, monkeypatch):
@@ -16,12 +20,17 @@ def test_adopted_hidden_bot_chat_is_canonical_but_not_recent(tmp_path, monkeypat
         db.set_session_title(sid, 'Bot Chat')
         db.set_session_hidden(sid, True)
         db.append_message(sid, 'assistant', 'The retained bot reply')
+        route = 'agent:main:local:dm:' + sid
+        now = '2026-11-21T00:00:00+00:00'
+        policy = LocalSessionPolicy('cli', 'cli', str(tmp_path), 'test-model', (), '{}', '{}',
+                                    json.dumps({'TERMINAL_CWD': str(tmp_path)}))
         receipt = {'session_id': sid, 'legacy_session_id': sid, 'profile_id': str(tmp_path),
-                   'principal_id': actor.subject, 'route': 'agent:main:local:dm:' + sid,
-                   'entry': {'origin': {'platform': 'local', 'chat_id': sid, 'user_id': actor.subject}}}
-        with db._lock:
-            bind_legacy_target(db, db._conn, receipt)
-            db._conn.commit()
+                   'principal_id': actor.subject, 'request_id': 'adopt-' + sid, 'route': route,
+                   'policy': asdict(policy), 'entry': {
+                       'session_id': sid, 'session_key': route, 'created_at': now, 'updated_at': now,
+                       'origin': {'platform': 'local', 'chat_id': sid, 'user_id': actor.subject, 'chat_type': 'dm'},
+                   }}
+        commit_local_session(db, epoch=begin_runtime_epoch(db, instance_id='test'), receipt=receipt)
         authority = SimpleNamespace(db=db, profile_id=str(tmp_path))
         before = db._conn.total_changes
         row = _profiles(authority, actor, tmp_path, {})['profiles'][0]

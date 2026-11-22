@@ -31,7 +31,7 @@ from hermes_state_ids import new_session_id as mint_session_id
 from agent.i18n import t
 from agent.message_metadata import message_identity
 from agent.turn_context import extract_api_content_sidecar
-from hermes_cli.cli_agent_setup_mixin import _gateway_open, _retire_agent
+from hermes_cli.cli_agent_setup_mixin import _gateway_open, _retire_agent, _route_lock_refusal
 from hermes_cli.cli_commands_session_tools import (
     CLICommandsSessionToolsMixin, _TTYBuf, _accent, _accent_line, _command_arg, _cp, _dim,
     _dim_line, _gt, _lines, _pr, _probe, _rollback_kept, _save, _say_block, _shlex_args, _t, _tn)
@@ -826,6 +826,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         from hermes_cli.kanban_resume_guard import kanban_resume_refusal
         if (kanban_refusal := kanban_resume_refusal(self._session_db, target_id)):
             return _cp(f"  {kanban_refusal}")
+        if (locked := _route_lock_refusal(self._session_db, target_id)):  # stays on the current session
+            return _cp(f"  {locked}")
         # One session.resume, before anything changes: it subscribes the target and names its receipt
         # owner; a target the gateway refuses this viewer stops the switch, so the current session is
         # neither ended nor swapped for one whose next prompt would be refused.
@@ -919,6 +921,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
             return _cp(f"  {_gt('branch.no_conversation')}")
         if not self._session_db:
             return _cp(_db_unavailable_line())
+        if (locked := _route_lock_refusal(self._session_db, self.session_id, allow_unpersisted=True)):  # no copy
+            return _cp(f"  {locked}")
         # CLI has no threads: always in place; strip the gateway's ``--here`` so it is never a title.
         from gateway.slash_commands_branch_thread import parse_branch_args
         _, branch_name = parse_branch_args(_command_arg(cmd_original))

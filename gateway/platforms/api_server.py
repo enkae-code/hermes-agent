@@ -131,6 +131,7 @@ from gateway.platforms._shared import coerce_port as _coerce_port, get_scoped_se
 from gateway.platforms._shared import secrets_match
 from gateway.platforms.tcp_site import start_tcp_site
 from hermes_state_errors import SessionActiveWriteGuardError
+from hermes_state_runtime import RuntimeStoreError
 
 
 logger = logging.getLogger(__name__)
@@ -2496,12 +2497,39 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return None, _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
         return session, None
 
+    async def _require_route_unlocked(self, session_id: str) -> None:
+        """Route-lock fence for every API turn/copy on *session_id* (its whole compression lineage):
+        raises ``RuntimeStoreError`` — ``route_lock_mismatch`` for a locked session, else
+        ``storage_unavailable`` when the policy cannot be verified. Never degrades to an empty history."""
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return
+        from hermes_state_local import require_legacy_execution
+        try:
+            await asyncio.to_thread(require_legacy_execution, db, session_id, allow_unpersisted=True)
+        except RuntimeStoreError:
+            raise
+        except Exception as exc:
+            raise RuntimeStoreError("storage_unavailable") from exc
+
+    async def _route_lock_refusal(self, session_id: str) -> Optional[web.Response]:
+        """``_require_route_unlocked`` as the HTTP refusal (409 / 503), or ``None`` when runnable."""
+        try:
+            await self._require_route_unlocked(session_id)
+        except RuntimeStoreError as exc:
+            from gateway.platforms.api_server_authority_runs import store_error_response
+            return store_error_response(_openai_error, exc)
+        return None
+
     async def _conversation_history_for_session(self, session_id: str) -> list[dict[str, Any]]:
         db = await self._ensure_session_db_async()
         if db is None:
             return []
+        await self._require_route_unlocked(session_id)
         try:
             return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+        except RuntimeStoreError:
+            raise
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
@@ -2749,9 +2777,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         limit = 500 if default_page else min(requested_limit, 500)
         include_compacted = _coerce_request_bool(request.query.get("include_compacted"), default=False)
         # Compression lineage: return root→tip messages, matching the REST router (#51058).
-        messages = await asyncio.to_thread(
-            db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
-            include_compacted=include_compacted, include_ancestors=True)
+        try:
+            messages = await asyncio.to_thread(
+                db.get_messages, resolved_id, limit=limit, offset=offset, latest=latest_page,
+                include_compacted=include_compacted, include_ancestors=True)
+        except RuntimeStoreError as exc:  # P1: a route-locked session's transcript is never a generic GET
+            from gateway.platforms.api_server_authority_runs import store_error_response
+            return store_error_response(_openai_error, exc)
         return web.json_response({
             "object": "list", "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
@@ -2767,6 +2799,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         source, err = await self._get_existing_session_or_404(source_id)
         if err:
             return err
+        if (refused := await self._route_lock_refusal(source_id)) is not None:  # before any child row or end
+            return refused
         body, err = await self._read_json_body(request)
         if err:
             return err
@@ -2815,6 +2849,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return None, err
+        if (refused := await self._route_lock_refusal(session_id)) is not None:  # before the model-lock write
+            return None, refused
         body, err = await self._read_json_body(request)
         if err:
             return None, err
@@ -3054,9 +3090,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return handed_off
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
-        history = await self._conversation_history_for_session(session_id)
         from gateway.platforms.api_server_authority_runs import RuntimeStoreError, store_error_response
         try:
+            history = await self._conversation_history_for_session(session_id)
             result, usage = await self._run_agent(conversation_history=history, **ctx["run_kwargs"])
             # One policy-gated re-run of a transiently failed turn, as the local (``tools.bot_mode_dm``)
             # and relayed (``tui_gateway.methods_bot_relay``) delivery lanes do (#93091 item 5, #115325):

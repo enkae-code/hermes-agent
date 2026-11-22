@@ -7,6 +7,7 @@ programmatic callers use :func:`build_trace_jsonl` + :func:`_do_upload`."""
 
 from __future__ import annotations
 
+from hermes_state_local import RouteLockedContent, require_content
 from pm import install_hint
 import json
 import logging
@@ -224,15 +225,20 @@ def _do_upload(
             f"View in the trace viewer: https://huggingface.co/datasets/{repo_id}")
 
 
+def read_session_messages(db, session_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """``(messages, meta)`` of a resolved session; the one trace loader (upload and local render). A route-locked
+    session raises ``RouteLockedContent`` even under an owner grant: a trace leaves the owner's view (P4)."""
+    require_content(db, session_id, allow_grant=False)
+    return db.get_messages_as_conversation(session_id), db.get_session(session_id) or {}
+
+
 def load_session_messages(session_id: str, db_path=None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """``(messages, meta)`` from SQLite; ``meta`` is ``{}`` when the session row is missing (a live, untitled
     session may still have messages)."""
     from hermes_state_registry import acquire, release_or_close
     db = acquire(db_path or None)
     try:
-        resolved = db.resolve_session_id(session_id) or session_id
-        meta = db.get_session(resolved) or {}
-        return db.get_messages_as_conversation(resolved), meta
+        return read_session_messages(db, db.resolve_session_id(session_id) or session_id)
     finally:
         release_or_close(db)
 
@@ -249,6 +255,8 @@ def upload_session_trace(
         return _NO_TOKEN_MESSAGE
     try:
         messages, meta = load_session_messages(session_id, db_path=db_path)
+    except RouteLockedContent as e:  # P4: refusal, not a diagnostic that could be retried or worked around
+        return f"Trace upload refused ({e.reason}): this session is route-locked and cannot leave its owning gateway."
     except Exception as e:
         logger.warning("Failed to load session %s for trace upload: %s", session_id, e)
         return f"Could not load session {session_id}: {e}"

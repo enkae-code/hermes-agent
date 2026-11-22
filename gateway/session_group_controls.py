@@ -391,18 +391,20 @@ def _bot_sessions(authority, actor):
 
 
 def _read_bot_sessions(db, subject, operator):
+    from hermes_state_local import content_sql_filter
     from hermes_state_local_migration import LEGACY_PREFIX
     from hermes_state_sessions import INTERNAL_LISTING_SOURCES
     hidden_sources = ','.join('?' * len(INTERNAL_LISTING_SOURCES))
     owner_filter, owner_params = ('', ()) if operator else ('user_id=? AND ', (subject,))
     # One read connection for the whole row. A store closed meanwhile (its profile unserved
     # mid-poll) refuses rather than reopening a writer into a home that is being deleted.
-    with db._read_ctx(reopen=False) as conn:
+    with db._read_ctx(reopen=False) as conn, content_sql_filter(db, conn):
         def summary(root):
             tip = db._compression_tip_on(conn, root['id'])
             target = conn.execute('SELECT * FROM sessions WHERE id=?', (tip,)).fetchone() or root
             message = conn.execute(
                 "SELECT content FROM messages WHERE session_id=? AND active=1 "
+                "AND route_content_readable(session_id) "
                 "AND role IN ('user','assistant') AND TRIM(COALESCE(content,''))!='' "
                 "ORDER BY id DESC LIMIT 1", (tip,)).fetchone()
             text = ' '.join(str(message[0] or '').split()) if message else ''
