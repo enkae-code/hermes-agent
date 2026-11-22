@@ -211,10 +211,13 @@ class SessionProfileRepairMixin:
         """Everything the target store needs to hold *session_id* as its own: the row (every column),
         the resolved system prompt, EVERY message row (inactive and compacted generations included —
         a move is not an export) and its usage rows."""
+        from hermes_state_local import content_snapshot, require_content
+
         def _read(conn):
             session = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
             if session is None:
                 return None
+            require_content(self, session_id, conn=conn)  # a locked session never leaves its store (same snapshot)
             def _stored(prompt_hash):
                 row = conn.execute("SELECT prompt FROM system_prompts WHERE hash = ?", (prompt_hash,)).fetchone()
                 return row[0] if row else None
@@ -227,7 +230,10 @@ class SessionProfileRepairMixin:
                 "SELECT * FROM session_model_usage WHERE session_id = ?", (session_id,))]
             return {"session": dict(session), "system_prompt": prompt, "tool_pin": tool_pin, "messages": messages,
                     "usage": usage}
-        payload = self._read_retrying_ioerr(_read)
+        def _snapshot(conn):
+            with content_snapshot(conn):
+                return _read(conn)
+        payload = self._read_retrying_ioerr(_snapshot)
         if payload is not None and session_id in self._ledgered_session_ids():
             # Re-checked at apply time: the scan may predate a turn, and copying first would leave
             # the session in both stores once the ledger's RESTRICT FK refuses the source delete.

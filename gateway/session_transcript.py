@@ -628,6 +628,17 @@ class SessionTranscriptMixin:
         except Exception as e:
             raise TranscriptReadError(session_id) from e
 
+    def load_owner_transcript(self, session_id: str) -> list[dict[str, Any]]:
+        """``load_transcript`` for the owner's own admitted turn: a route-locked owner's history is granted
+        here, on the store that resolves *session_id*. Call only after that turn was admitted for it."""
+        from hermes_state_local import owner_content_grant
+
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return []
+        with owner_content_grant(db, session_id):
+            return self.load_transcript(session_id)
+
     def load_transcript(self, session_id: str) -> list[dict[str, Any]]:
         """Load all messages from a session's transcript (state.db is canonical). Reads follow the
         same routing writes use — the in-memory reroute map, then the durable compression tip —

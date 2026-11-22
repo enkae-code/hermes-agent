@@ -750,6 +750,8 @@ class GatewayStartupMixin:
         nothing, any other goes to the delivery ledger for the boot sweep. Without the ledger a
         presentable reply stays marked and resumes."""
         from gateway.delivery_ledger import compute_obligation_id, ledger_enabled, record_crash_left_reply
+        from gateway.session_transcript import TranscriptReadError
+        from hermes_state_local import RouteLockedContent
         ledger_on = await asyncio.to_thread(ledger_enabled)
         cutoff = time.time() - max_age_seconds  # older markers are cleared, never acted on
         with self.session_store._lock:
@@ -766,8 +768,15 @@ class GatewayStartupMixin:
             if started < cutoff:
                 continue
             decision = await self.async_session_store.get_session_metadata(key, "room_silence_decision", {})
-            text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                          started, origin, silence_decision=decision, active_token=token)
+            try:
+                history = await self.async_session_store.load_transcript(session_id)
+            except TranscriptReadError as exc:
+                # A route-locked session is never read here (no grant: boot is not that owner's turn). Nothing
+                # is ledgered or delivered from it; its marker stays so the owner's recovery resumes it.
+                if not isinstance(exc.__cause__, RouteLockedContent):
+                    raise
+                continue
+            text = self._crash_left_reply(history, started, origin, silence_decision=decision, active_token=token)
             if text is None or (text and not ledger_on):
                 continue  # no final reply to deliver: the turn resumes
             if text:

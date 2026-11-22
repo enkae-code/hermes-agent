@@ -24,6 +24,7 @@ from hermes_state_common import (
     escape_like as _escape_like, fts_rebuild_admission, fts_trigram_session_sql, routed_sessions_setting,
 )
 from hermes_state_fts import fts_layout_current, fts_layout_drift
+from hermes_state_local import content_snapshot, content_sql_filter, require_content
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -165,6 +166,7 @@ FROM target t JOIN messages m ON m.id IN (
      WHERE n.session_id = t.session_id AND (n.timestamp, n.id) > (t.timestamp, t.id)
      ORDER BY n.timestamp, n.id LIMIT 1)
 )
+WHERE route_content_readable(m.session_id)
 ORDER BY t.id, m.timestamp, m.id"""
 # Unified Ideographs, Extension A, Extension B, CJK Symbols, Hiragana, Katakana, Hangul Syllables.
 _CJK_RANGES = (
@@ -266,6 +268,8 @@ def _search_filter_clauses(
     filled by out-of-window hits."""
     if not include_inactive:
         where.append("(m.active = 1 OR m.compacted = 1)")
+    # Route-locked sessions never reach ranking, LIMIT/OFFSET or snippets (UDF is bound by _filtered_rows).
+    where.append("route_content_readable(m.session_id)")
     # display_kind="hidden" rows are model-facing scaffolding the person never saw; a hit would confuse.
     where.append("COALESCE(m.display_kind, '') <> 'hidden'")
     if source_filter is not None:
@@ -846,6 +850,7 @@ class SessionSearchMixin:
         window (empty when it overlaps the head/tail). Empty result when the anchor isn't
         in the session."""
         bookend = max(bookend, 0)
+        require_content(self, session_id)  # before the anchor probe: a locked session gives no empty-vs-hit oracle
         primitive = self.get_messages_around(session_id, around_message_id, window=window)
         window_rows = primitive["window"]
         if not window_rows:
@@ -860,7 +865,8 @@ class SessionSearchMixin:
         if bookend > 0:
             role_clause = "" if keep_roles is None else f" AND role IN ({','.join('?' for _ in keep_roles)})"
             role_params = [] if keep_roles is None else list(keep_roles)
-            with self._read_ctx() as conn:
+            with self._read_ctx() as conn, content_snapshot(conn):
+                require_content(self, session_id, conn=conn)  # bookends re-checked in their own snapshot
                 def _bookend(op: str, boundary_id: int, order: str):
                     return conn.execute(
                         f"SELECT * FROM messages "
@@ -894,7 +900,8 @@ class SessionSearchMixin:
         # A /steer row is typed for the renderer but is human input: keep it so the DB pick agrees
         # with the in-memory user_originated_turn_view count.
         display_clause = " AND (display_kind IS NULL OR display_kind = '' OR display_kind = 'steer')"
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, content_snapshot(conn):
+            require_content(self, session_id, conn=conn)
             rows = conn.execute(
                 "SELECT id, timestamp, content FROM messages WHERE session_id = ? AND role = 'user'"
                 f"{active_clause}{display_clause} "
@@ -1017,6 +1024,13 @@ class SessionSearchMixin:
 
     # ── Query builders / runners ───────────────────────────────────────────
 
+    def _filtered_rows(self, sql: str, params: Any) -> list[sqlite3.Row]:
+        """Run a search SELECT with ``route_content_readable`` bound to the same snapshot (no check-then-read gap)."""
+        def run(conn):
+            with content_sql_filter(self, conn):
+                return conn.execute(sql, params).fetchall()
+        return self._read_retrying_ioerr(run)
+
     @staticmethod
     def _fts_match_sql(table: str, match_query: str, order_by_sql: str, *, limit: int, offset: int,
                        **filters) -> tuple[str, list]:
@@ -1040,7 +1054,7 @@ class SessionSearchMixin:
         search never runs the unbounded rebuild. Other ``DatabaseError``s propagate."""
         sql, params = self._fts_match_sql(table, match_query, order_by_sql, **kwargs)
         try:
-            return [dict(row) for row in self._read_all(sql, params)]
+            return [dict(row) for row in self._filtered_rows(sql, params)]
         except sqlite3.OperationalError:
             if operational_debug:
                 logger.debug(operational_debug, exc_info=True)
@@ -1056,7 +1070,7 @@ class SessionSearchMixin:
     def _like_rows(self, where: list[str], params: list, *, order_by: str, limit_sql: str) -> list[dict[str, Any]]:
         """Canonical-table LIKE scan; ``params[0]`` is the snippet anchor term."""
         sql = _search_select_sql(_LIKE_SNIPPET_SQL, "messages m", where, order_by, limit_sql)
-        return [dict(row) for row in self._read_all(sql, params)]
+        return [dict(row) for row in self._filtered_rows(sql, params)]
 
     @staticmethod
     def _compile_like_boolean_query(query: str) -> tuple[str, list[Any], Optional[str]]:
@@ -1129,7 +1143,7 @@ class SessionSearchMixin:
                 contexts = {match["id"]: [] for match in batch}
                 try:
                     sql = _CONTEXT_WINDOW_SQL.format(ids=",".join("?" for _ in contexts))
-                    with self._read_ctx() as conn:
+                    with self._read_ctx() as conn, content_sql_filter(self, conn):
                         rows = conn.execute(sql, list(contexts)).fetchall()
                     for row in rows:
                         contexts[row["match_id"]].append(row)
@@ -1220,7 +1234,7 @@ class SessionSearchMixin:
         else:
             sql, params = self._fts_match_sql("messages_fts", query, **route)
             try:
-                matches = [dict(row) for row in self._read_all(sql, params)]
+                matches = [dict(row) for row in self._filtered_rows(sql, params)]
             except sqlite3.OperationalError:
                 return []  # FTS5 syntax error despite sanitization
             except sqlite3.DatabaseError as exc:

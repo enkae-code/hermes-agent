@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from agent.compaction_display import project_compaction_message_for_display
 from agent.context_compressor import user_originated_turn_view
 from hermes_state_compaction_display import not_a_later_tool_copy_sql
+from hermes_state_local import require_content
 from hermes_state_messages import DISPLAY_VISIBLE_SQL
 
 
@@ -106,6 +107,7 @@ def get_session_messages_around(db, session_id, row_id, *, limit=120):
     the selected bounded page, even when the anchor is deep in a transcript.
     """
     with _snapshot(db) as conn:
+        require_content(db, session_id, conn=conn)  # before any anchor probe: no existence oracle
         _register_functions(db, conn)
         anchor = conn.execute(
             "SELECT content, display_kind, _compressed_summary FROM messages "
@@ -142,6 +144,7 @@ def get_session_messages_around(db, session_id, row_id, *, limit=120):
 def get_session_timeline(db, session_id, *, limit=500, after_row_id=0):
     """Chronological prompts. Cursor is the first physical row id of a logical turn."""
     with _snapshot(db) as conn:
+        require_content(db, session_id, conn=conn)
         _register_functions(db, conn)
         sql = _display_rows_sql(conn, session_id, users_only=True) + """,
             prompts AS MATERIALIZED (

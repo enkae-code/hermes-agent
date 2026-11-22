@@ -20,7 +20,9 @@ from hermes_state_keys import (
     CRON_PRINCIPAL_ID, CRON_REQUEST_PREFIX, cron_request_range, cron_run_from_request, legacy_cron_run_job,
     prefix_range,
 )
-from hermes_state_local import POLICY_PREFIX
+from hermes_state_local import POLICY_PREFIX, content_readable, require_content
+from hermes_state_runtime import RuntimeStoreError
+from hermes_state_sessions import _local_candidate_sql
 from hermes_state_common import SCHEMA_SQL, _shape_preview, _sql_preview_raw, _sql_session_last_active
 from hermes_state_messages import _parse_tool_calls, _tool_calls_count
 import itertools
@@ -266,9 +268,12 @@ class SessionPortabilityMixin:
             "\n            ORDER BY s.started_at DESC, s.id DESC\n            LIMIT :limit OFFSET :offset",
             prompt_select=f",\n                {_PROMPT_RESOLVED_SQL}",
         )
-        rows = self._read_rows(query, {"prefix": prefix, "prefix_hi": prefix_hi, "request_lo": request_lo,
-                                       "request_hi": request_hi, "job_id": job_id, "limit": limit, "offset": offset})
-        return [{**self._rich_row(row), "cron_job_id": job_id} for row in rows]
+        with self.transcript_read_snapshot(), self._read_ctx() as conn:  # rows and their route-lock check: one generation
+            rows = [self._rich_row(row) for row in self._read_rows(query, {
+                "prefix": prefix, "prefix_hi": prefix_hi, "request_lo": request_lo, "request_hi": request_hi,
+                "job_id": job_id, "limit": limit, "offset": offset})]
+            rows = self._redact_locked(rows, self._locked_ids(conn, [row["id"] for row in rows]))
+        return [{**row, "cron_job_id": job_id} for row in rows]
 
     def cron_run_identity(self, session_id: str) -> Optional[dict[str, Any]]:
         """``{"cron_job_id", "cron_execution_id"}`` of a cron run session, else None: a legacy id
@@ -315,14 +320,14 @@ class SessionPortabilityMixin:
             self._compact_session_cols() if compact_rows else "s.*", f"s.id IN ({','.join('?' for _ in ids)})",
             prompt_select=None if compact_rows else f", {_PROMPT_RESOLVED_SQL}",
         )
-        return {s["id"]: s for s in map(self._rich_row, self._read_rows(query, ids))}
+        return {s["id"]: s for s in self._read_gated(query, ids, self._rich_row)}
 
     def list_skill_scaffolded_sessions(self, limit: int = 200) -> list[dict[str, Any]]:
         """Titled sessions whose first user turn was a ``/skill`` invocation or a gateway
         auto-load scaffold (their titles describe the expanded skill body, not the
         request). Returns ``id``, ``title`` and the first-turn ``content`` so callers can
         re-derive what was typed. Newest first."""
-        rows = self._read_rows("""
+        return self._read_gated("""
                 SELECT s.id, s.title, m.content
                 FROM sessions s
                 JOIN messages m ON m.id = (
@@ -332,10 +337,10 @@ class SessionPortabilityMixin:
                     ORDER BY m2.timestamp, m2.id LIMIT 1
                 )
                 WHERE s.title IS NOT NULL AND (m.content LIKE ? OR m.content LIKE ?)
+                  AND route_content_readable(s.id)
                 ORDER BY s.started_at DESC
                 LIMIT ?
-                """, (SKILL_SCAFFOLD_SQL_LIKE, AUTO_LOAD_SCAFFOLD_SQL_LIKE, int(limit)))
-        return [dict(row) for row in rows]
+                """, (SKILL_SCAFFOLD_SQL_LIKE, AUTO_LOAD_SCAFFOLD_SQL_LIKE, int(limit)), exclude=True)  # first-turn content
 
     # ── Export ─────────────────────────────────────────────────────────────
 
@@ -351,17 +356,31 @@ class SessionPortabilityMixin:
         back through :meth:`import_sessions`, because that projection is deduped and ordered for display, and
         importing it would make those turns live context. ``include_inactive`` exports every row in storage
         order with its ``active``/``compacted`` flags, which :meth:`import_sessions` restores as archived."""
-        session = self.get_session(session_id)
-        return self._with_messages(session, include_compacted, include_inactive) if session else None
+        # One read generation for the route-lock check and every read it admits; a locked, ungranted session raises.
+        def read():
+            require_content(self, session_id)
+            session = self.get_session(session_id)
+            return self._with_messages(session, include_compacted, include_inactive) if session else None
+        return self._export_generation(read)
+
+    def _export_generation(self, read):
+        """``read()`` on one generation: re-run when the snapshot ended early or, unpinned (no pooled reader),
+        when a write landed meanwhile, so a lock minted mid-export is never read around."""
+        for _ in range(3):
+            with self.transcript_read_snapshot() as consistent:
+                result = read()
+                if consistent():
+                    return result
+        raise RuntimeStoreError('storage_unavailable')
 
     def export_session_lineage(self, session_id: str, include_compacted: bool = False,
                                include_inactive: bool = False) -> Optional[dict[str, Any]]:
         """Export a compression lineage as one logical session dict (flags as in :meth:`export_session`)."""
-        lineage_ids = self.get_compression_lineage(session_id)
-        if not lineage_ids:
-            return None
-        segments = [seg for seg in (self.export_session(sid, include_compacted, include_inactive)
-                                    for sid in lineage_ids) if seg]
+        def read():  # every segment is checked and read on one generation
+            lineage_ids = self.get_compression_lineage(session_id)
+            return [seg for seg in (self.export_session(sid, include_compacted, include_inactive)
+                                    for sid in lineage_ids or ()) if seg]
+        segments = self._export_generation(read)
         if not segments:
             return None
         messages = [msg for seg in segments for msg in (seg.get("messages") or [])]
@@ -377,7 +396,14 @@ class SessionPortabilityMixin:
         :meth:`export_session`; that display read dedupes per session, so it skips the batched read).
         Backups that go back through :meth:`import_sessions` pass ``include_inactive`` so
         compaction-archived turns survive the round trip as archived rows."""
-        sessions = self.search_sessions(source=source, limit=100000)
+        # A bulk export never carries a route-locked session's content (its row is dropped, not blanked), judged
+        # on the same read generation as the rows it admits.
+        return self._export_generation(lambda: self._export_all_admitted(source, include_compacted, include_inactive))
+
+    def _export_all_admitted(self, source, include_compacted, include_inactive):
+        sessions = self.search_sessions(source=source, limit=-1)  # no LIMIT: a cap would silently truncate a backup
+        with self._read_ctx() as conn:  # no owner grant: a bulk export never carries locked content
+            sessions = [s for s in sessions if content_readable(self, s["id"], conn=conn, allow_grant=False)]
         if include_compacted:
             return [self._with_messages(session, True, include_inactive) for session in sessions]
         messages_by_session = {session["id"]: [] for session in sessions}

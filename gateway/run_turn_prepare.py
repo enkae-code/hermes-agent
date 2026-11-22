@@ -842,7 +842,10 @@ class GatewayTurnPrepareMixin:
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
         try:
-            history = await self.async_session_store.load_transcript(session_entry.session_id)
+            # Owner replay: this turn was admitted for session_entry (the lease above), so its route-locked owner is granted.
+            store = self.async_session_store
+            load = store.load_owner_transcript if source.platform == Platform.LOCAL else store.load_transcript
+            history = await load(session_entry.session_id)
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )

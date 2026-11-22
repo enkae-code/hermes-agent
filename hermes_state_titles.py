@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, Optional
 
 from agent.message_sanitization import _sanitize_surrogates
+from hermes_state_sessions import _local_candidate_sql
 from hermes_state_common import (
     _COMPRESSION_CHILD_SQL, _RECOVERABLE_END_REASONS, _RECOVERABLE_END_REASONS_SQL,
     _non_continuation_child_sql, escape_like as _escape_like,
@@ -191,13 +192,16 @@ class SessionTitlesMixin:
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
-        row = self._read_one("SELECT title FROM sessions WHERE id = ?", (session_id,))
-        return row["title"] if row else None
+        row, locked = self._read_session_gated(
+            f"SELECT s.id, s.title, {_local_candidate_sql()} AS _rc FROM sessions s WHERE s.id = ?", (session_id,))
+        return None if locked or not row else row["title"]  # a locked, ungranted title is content
 
     def get_session_title_source(self, session_id: str) -> Optional[str]:
         """Get the provenance of a session's title, or None when untitled."""
-        row = self._read_one("SELECT title, title_source FROM sessions WHERE id = ?", (session_id,))
-        return row["title_source"] if row and row["title"] is not None else None
+        row, locked = self._read_session_gated(
+            f"SELECT s.id, s.title, s.title_source, {_local_candidate_sql()} AS _rc FROM sessions s WHERE s.id = ?",
+            (session_id,))
+        return row["title_source"] if row and not locked and row["title"] is not None else None
 
     def set_session_title_source(self, session_id: str, source: str) -> bool:
         """Overwrite a title's provenance without touching the text (a title copied across a
@@ -249,11 +253,11 @@ class SessionTitlesMixin:
         Bot Mode mints a fresh one (#139779). Recoverable auto-archives stay visible for #92687
         resurrection. Every other title keeps returning its archived row (``-c``, ``/resume``).
         """
-        row = self._read_one(
-            "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-            "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-            "WHERE s.title = ?", (title,))
-        if not row:
+        row, locked = self._read_session_gated(
+            "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
+            f"{_local_candidate_sql()} AS _rc FROM sessions s "
+            "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash WHERE s.title = ?", (title,))
+        if not row or locked:  # a locked row is absent to title lookups, never resolved
             return None
         session = self._session_row_dict(row)
         if title != self.CANONICAL_BOT_CHAT_TITLE or not session.get("archived"):
@@ -278,10 +282,10 @@ class SessionTitlesMixin:
         if title == self.CANONICAL_BOT_CHAT_TITLE:
             return exact["id"] if exact is not None else None
         # Escape LIKE wildcards so "%"/"_" in titles cannot false-match.
-        numbered = self._read_all(
+        numbered = self._read_gated(
             "SELECT id, title, started_at FROM sessions "
             "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
-            (f"{_escape_like(title)} #%",))
+            (f"{_escape_like(title)} #%",), exclude=True)
         return numbered[0]["id"] if numbered else (exact["id"] if exact else None)
 
     def get_next_title_in_lineage(self, base_title: str) -> str:

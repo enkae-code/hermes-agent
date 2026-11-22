@@ -2,6 +2,7 @@
 flags (end/reopen/archive/pin/hide/read), model_config patching, listing and
 counting, delete cascades, and the auto-archive sweep."""
 
+import functools
 import glob
 import json
 import logging
@@ -27,6 +28,20 @@ from hermes_state_compression import _CHAIN_CAP, _UNSET_CREATED_SQL
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
+
+
+@functools.cache
+def _local_candidate_sql() -> str:
+    """SQL predicate (``s`` = sessions): this row MAY hold a local receipt (a receipt key, or the canonical route/origin marker).
+    A superset of ``hermes_state_local._legacy_policy_owner``'s candidacy: a false positive only costs the
+    classification, a false negative would leak, so the markers are matched loosely. A row that is not a
+    candidate is not route-locked and needs no further statement."""
+    from hermes_state_local import POLICY_PREFIX
+    from hermes_state_local_migration import LEGACY_PREFIX
+
+    keys = ', '.join(f"'{prefix}' || s.{col}" for prefix in (POLICY_PREFIX, LEGACY_PREFIX) for col in ('id', 'chat_id'))
+    return (f"(EXISTS (SELECT 1 FROM state_meta WHERE key IN ({keys})) OR s.session_key LIKE 'agent:%:local%'"
+            " OR COALESCE(s.origin_json, '') LIKE '%local%')")
 
 
 def workspace_key(row: dict[str, Any]) -> Optional[str]:
@@ -833,26 +848,82 @@ class SessionSessionsMixin:
         """Persisted YOLO flag; False on any parse failure (resume must never enable the bypass)."""
         return bool(_parse_model_config((session_meta or {}).get("model_config")).get("yolo_mode"))
 
+    def _read_session_gated(self, sql: str, params: Any = ()) -> tuple[Optional[dict[str, Any]], bool]:
+        """``(row dict, locked)`` of one ``SELECT ..., <_local_candidate_sql()> AS _rc`` (``s`` = sessions; the
+        row must carry ``id``): the row and its route-lock classification in ONE read snapshot. A row that is
+        not a local candidate costs exactly this one statement; ``locked`` = content not readable here."""
+        from hermes_state_local import content_readable, content_snapshot
+
+        def read(conn):
+            with content_snapshot(conn):
+                row = conn.execute(sql, params).fetchone()
+                if row is None:
+                    return None, False
+                data = dict(row)
+                candidate = data.pop("_rc")
+                return data, bool(candidate) and not content_readable(self, data["id"], conn=conn)
+        return self._read_retrying_ioerr(read)
+
+    def _locked_ids(self, conn, ids) -> set[str]:
+        """Which of *ids* are route-locked and ungranted on *conn*'s snapshot (candidates only are classified)."""
+        from hermes_state_local import content_readable
+
+        locked: set[str] = set()
+        for chunk in _id_chunks(dict.fromkeys(i for i in ids if i), 400):
+            for (sid,) in conn.execute(
+                    f"SELECT s.id FROM sessions s WHERE s.id IN ({_session_ids_placeholders(chunk)}) AND {_local_candidate_sql()}",
+                    chunk).fetchall():
+                if not content_readable(self, sid, conn=conn):
+                    locked.add(sid)
+        return locked
+
+    @staticmethod
+    def _redact_locked(sessions: list[dict[str, Any]], locked: set[str], *, exclude: bool = False) -> list[dict[str, Any]]:
+        """Blank the content fields (title, preview, prompt) of *locked* rows; identity and lifecycle stay.
+        ``exclude`` drops them instead (title discovery: a locked row must not even be a candidate)."""
+        if exclude:
+            return [s for s in sessions if s["id"] not in locked]
+        for s in sessions:
+            if s["id"] in locked:
+                s.update({k: v for k, v in (("title", None), ("system_prompt", None), ("preview", "")) if k in s})
+        return sessions
+
+    def _read_gated(self, sql: str, params: Any = (), shape: Callable = dict, *, exclude: bool = False) -> list[dict[str, Any]]:
+        """``shape(row)`` for each row of *sql* (each shaped row must carry ``id``), with locked sessions redacted
+        (or ``exclude``d), in ONE read snapshot. ``route_content_readable(sid)`` is registered for *sql* so a
+        title/needle match can be gated in SQL before ranking and LIMIT."""
+        from hermes_state_local import content_sql_filter
+
+        def read(conn):
+            with content_sql_filter(self, conn):
+                rows = [shape(r) for r in conn.execute(sql, params).fetchall()]
+                return self._redact_locked(rows, self._locked_ids(conn, [r["id"] for r in rows]), exclude=exclude)
+        return self._read_retrying_ioerr(read)
+
     def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
-        """Get a session by ID (drains queued token deltas first so cost readers see exact totals)."""
+        """Get a session by ID (drains queued token deltas first so cost readers see exact totals).
+        A route-locked, ungranted session keeps identity and lifecycle but not its title or prompt."""
         self.flush_for_read()
-        row = self._read_one(
+        row, locked = self._read_session_gated(
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
-            "COALESCE(tp.prompt, s.tool_names) AS _tool_names_resolved "
+            f"COALESCE(tp.prompt, s.tool_names) AS _tool_names_resolved, {_local_candidate_sql()} AS _rc "
             "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
             "LEFT JOIN system_prompts tp ON tp.hash = s.tool_names WHERE s.id = ?",
             (session_id,),
         )
-        return self._session_row_dict(row) if row else None
+        if not row:
+            return None
+        session = self._session_row_dict(row)
+        return {**session, "title": None, "system_prompt": None, "_system_prompt_resolved": None} if locked else session
 
     def get_session_list_row(self, session_id: str) -> Optional[dict[str, Any]]:
         """Picker columns only: the live listing skips ``get_session``'s prompt/tool JOIN and flush."""
-        row = self._read_one(
-            "SELECT id, source, title, started_at, ended_at, message_count, model, hidden, archived "
-            "FROM sessions WHERE id = ?",
+        row, locked = self._read_session_gated(
+            "SELECT s.id, s.source, s.title, s.started_at, s.ended_at, s.message_count, s.model, s.hidden, s.archived, "
+            f"{_local_candidate_sql()} AS _rc FROM sessions s WHERE s.id = ?",
             (session_id,),
         )
-        return dict(row) if row else None
+        return ({**row, "title": None} if locked else row) if row else None
 
     def get_recent_session_model_route(self, session_id: str) -> Optional[dict[str, Any]]:
         """Most recently used main-loop model route as one coherent per-call tuple
@@ -1106,17 +1177,19 @@ class SessionSessionsMixin:
             compact_needle = re.sub(r"[\W_]+", "", search_needle)
             search_clause = (
                 "EXISTS (SELECT 1 FROM chain cq JOIN sessions cs ON cs.id = cq.cur_id"
-                " WHERE cq.root_id = s.id AND (LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
-                " OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\'"
+                " WHERE cq.root_id = s.id AND (((LOWER(COALESCE(cs.title, '')) LIKE ? ESCAPE '\\'"
             )
-            params.extend([like(search_needle)] * 2)
+            params.append(like(search_needle))
             if compact_needle:
                 search_clause += (
                     " OR REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE(cs.title, '')),"
                     " '-', ''), '_', ''), '.', ''), ' ', '') LIKE ? ESCAPE '\\'"
                 )
                 params.append(like(compact_needle))
-            clauses.append(search_clause + "))")
+            # A locked session's title never matches: the page would otherwise be an oracle for its text.
+            search_clause += ") AND route_content_readable(cs.id)) OR LOWER(cq.cur_id) LIKE ? ESCAPE '\\')"
+            params.append(like(search_needle))
+            clauses.append(search_clause + ")")
         if not clauses:
             return where_sql, params
         combined = " AND ".join(clauses)
@@ -1276,13 +1349,15 @@ class SessionSessionsMixin:
                 return 1
             return 0
 
+        from hermes_state_local import content_snapshot
         try:
-            with self._read_ctx() as conn:
+            with self._read_ctx() as conn, content_snapshot(conn):
                 conn.set_progress_handler(_deadline_progress_handler, 1000)
                 try:
                     rows = conn.execute(query, params).fetchall()
                 finally:
                     conn.set_progress_handler(None, 0)
+                locked = self._locked_ids(conn, [row["id"] for row in rows])
         except sqlite3.OperationalError as exc:
             if interrupted_by_deadline and "interrupt" in str(exc).lower():
                 raise TimeoutError(
@@ -1296,7 +1371,7 @@ class SessionSessionsMixin:
             session["preview"] = _shape_preview(session.pop("_preview_raw", ""))
             session["unread"] = self.session_unread(session)
             sessions.append(session)
-        return sessions
+        return self._redact_locked(sessions, locked)
 
     @classmethod
     def _list_row(cls, row: sqlite3.Row) -> dict[str, Any]:
@@ -1427,7 +1502,7 @@ class SessionSessionsMixin:
                 LIMIT ? OFFSET ?
             """
             params.extend([limit, offset])
-        sessions = [self._list_row(row) for row in self._read_all(query, params)]
+        sessions = self._read_gated(query, params, self._list_row)
         # Pinned back-fill runs BEFORE compression projection so a back-filled root
         # projects to its tip like any other row. Do not inherit the archived
         # constraint: the sidebar lists with include_archived=False, and a pin
@@ -1453,8 +1528,7 @@ class SessionSessionsMixin:
                 {pinned_where}
                 ORDER BY s.started_at DESC
             """
-            for row in self._read_all(pinned_query, pinned_params):
-                s = self._list_row(row)
+            for s in self._read_gated(pinned_query, pinned_params, self._list_row):
                 if s["id"] not in seen_ids:
                     seen_ids.add(s["id"])
                     sessions.append(s)
@@ -1570,14 +1644,14 @@ class SessionSessionsMixin:
             ws_clause, ws_params = _workspace_key_clause(workspace_key)
             where_clauses.append(ws_clause)
             params.extend(ws_params)
-        return [self._session_row_dict(row) for row in self._read_all(
+        return self._read_gated(
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
             f"{_sql_session_last_active('s')} AS last_active "
             "FROM sessions s LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
             f"{_where_sql(where_clauses, ' ')} "
             "ORDER BY last_active DESC, s.started_at DESC, s.id DESC LIMIT ? OFFSET ?",
-            [*params, limit, offset],
-        )]
+            [*params, limit, offset], self._session_row_dict,
+        )
 
     def session_count(
         self, source: str | None = None, sources: list[str] | None = None, cwd_prefix: str | None = None,

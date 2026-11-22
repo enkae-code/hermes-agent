@@ -296,6 +296,14 @@ def _durable_session_exists(db, session_id: str) -> Optional[bool]:
         return None
 
 
+def owner_grant(db, session_id):
+    """Owner content grant on *db* for an already-admitted *session_id* (no-op for stores without route locks)."""
+    if not hasattr(db, "transcript_read_snapshot"):
+        return nullcontext()
+    from hermes_state_local import owner_content_grant
+    return owner_content_grant(db, session_id)
+
+
 def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: dict[str, Any],
     conversation_history: Optional[list[dict[str, Any]]],
@@ -384,9 +392,12 @@ def admit_durable_turn_lease(
             if latest_session_id:
                 agent.session_id = latest_session_id
                 task_context["session_id"] = latest_session_id
-            reloaded = db.get_messages_as_conversation(
-                agent.session_id, repair_alternation=True, include_row_ids=True
-            )
+            # Granted for the id this turn was admitted under (lease held above): a rotation inside the same
+            # owner stays covered, another owner's id does not.
+            with owner_grant(db, session_id):
+                reloaded = db.get_messages_as_conversation(
+                    agent.session_id, repair_alternation=True, include_row_ids=True
+                )
             # Decide on the stored rows alone: an unknown row that reloads nothing keeps the
             # caller's history, which already holds any carried input below.
             if durable or reloaded:

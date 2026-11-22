@@ -1,8 +1,11 @@
 """Private local creation receipts in the canonical runtime transaction owner."""
 import json
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 
@@ -409,12 +412,15 @@ def _legacy_policy_owner(conn, row):
     local_route = len(parts) >= 3 and parts[0] == 'agent' and parts[2] == 'local'
     route_owner = parts[4] if local_route and len(parts) == 5 else None
     candidates = tuple(dict.fromkeys(filter(None, (session_id, chat_id, route_owner))))
-    owners = []
-    for candidate in candidates:
-        saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + candidate,)).fetchone()
-        binding = conn.execute('SELECT 1 FROM state_meta WHERE key=?', (LEGACY_PREFIX + candidate,)).fetchone()
-        if saved is not None or binding is not None:
-            owners.append((candidate, saved))
+    keys = {prefix + candidate: (candidate, prefix == POLICY_PREFIX)
+            for candidate in candidates for prefix in (POLICY_PREFIX, LEGACY_PREFIX)}
+    found = {}
+    for key, value in conn.execute(
+            f"SELECT key,value FROM state_meta WHERE key IN ({','.join('?' for _ in keys)})", tuple(keys)):
+        candidate, policy = keys[key]
+        if policy or candidate not in found:
+            found[candidate] = (value,) if policy else None
+    owners = list(found.items())
     origin = _receipt(row['origin_json']) or {}
     canonical = local_route or origin.get('platform') == 'local'
     if not owners and not canonical:
@@ -484,6 +490,136 @@ def require_legacy_execution(db, session_id, *, allow_unpersisted=False):
                     raise refusal('this session must run through its owning gateway')
         if not consistent():
             raise RuntimeStoreError('storage_unavailable')
+
+
+class RouteLockedContent(RuntimeStoreError):
+    """A stored-content read of a route-locked session without an owner grant (phase B1)."""
+
+
+# (db, owner id) of the owner read in progress on this thread or task. Set only by owner_content_grant.
+_OWNER_GRANT: ContextVar[tuple | None] = ContextVar('route_lock_owner_grant', default=None)
+
+
+@contextmanager
+def content_snapshot(conn):
+    """Reuse an outer transaction or hold one SQLite generation for authorization and payload."""
+    began = not conn.in_transaction
+    if began:
+        conn.execute('BEGIN')
+    try:
+        yield conn
+    finally:
+        if began and conn.in_transaction:
+            conn.execute('ROLLBACK')
+
+
+@contextmanager
+def content_sql_filter(db, conn, *, allow_grant=False):
+    """The same policy in SQL WHERE/CASE, before ranking, pagination and hydration."""
+    answers = {}
+
+    def readable(sid):
+        if sid not in answers:
+            answers[sid] = content_readable(db, sid, conn=conn, allow_grant=allow_grant)
+        return answers[sid]
+
+    with content_snapshot(conn):
+        conn.create_function('route_content_readable', 1, readable)
+        try:
+            yield conn
+        finally:
+            conn.create_function('route_content_readable', 1, None)
+
+
+def _locked_owner(conn, session_id):
+    """``(owner, locked)`` of physical segment *session_id*: the creation id whose receipt it belongs to,
+    and whether that receipt is route-locked. A canonical marker that cannot be verified is locked with
+    no owner, so no grant matches it (fail closed). A session with no local receipt is ``(None, False)``.
+
+    An ordinary row costs this one indexed statement: its own row left-joined to the receipt keys its
+    id and ``chat_id`` could name. Anything that matched, or looks local, takes the full owner lookup.
+    The receipt is verified by what it owns (identity plus ``validate_local_lineage``), not by the
+    legacy-binding shape ``_verified_legacy_policy`` demands of an execution: a canonical ``local:<id>``
+    route is a valid owner here and must not read as unverifiable (it locked every reset child out)."""
+    from gateway.session_route_lock import is_locked
+
+    rows = conn.execute(
+        'SELECT s.id,s.chat_id,s.session_key,s.user_id,s.origin_json,m.key FROM sessions s '
+        'LEFT JOIN state_meta m ON m.key IN (?1||s.id,?2||s.id,?1||s.chat_id,?2||s.chat_id) WHERE s.id=?3',
+        (POLICY_PREFIX, _legacy_prefix(), session_id)).fetchall()
+    if not rows:
+        return None, False
+    row = rows[0]
+    try:
+        if len(rows) == 1 and rows[0]['key'] is None and not _canonical(row):
+            return None, False
+        owned = _legacy_policy_owner(conn, row)
+        if owned is None:
+            return None, False
+        return owned[0], is_locked(_owned_policy(conn, row, *owned))
+    except sqlite3.Error:
+        raise
+    except Exception:
+        return None, True
+
+
+def _legacy_prefix():
+    from hermes_state_local_migration import LEGACY_PREFIX
+    return LEGACY_PREFIX
+
+
+def _canonical(row):
+    parts = (row['session_key'] or '').split(':', 4)
+    return (len(parts) >= 3 and parts[0] == 'agent' and parts[2] == 'local'
+            or (_receipt(row['origin_json']) or {}).get('platform') == 'local')
+
+
+def _owned_policy(conn, row, owner, receipt):
+    """*receipt*'s frozen policy once *row* is verified to be one of *owner*'s lineage segments."""
+    from gateway.session_policy import restore_policy
+    from hermes_state_local_lineage import adoptable_compression, validate_local_lineage, with_adopted_compression
+
+    if (adoptable := adoptable_compression(conn, receipt)) is not None:
+        receipt = with_adopted_compression(receipt, adoptable[0])
+    validate_local_lineage(conn, receipt)
+    if (receipt['session_id'] != owner or row['id'] not in receipt.get('lineage', [owner])
+            or (row['session_key'], row['chat_id'], row['user_id']) != (receipt['route'], owner, receipt['principal_id'])):
+        raise RuntimeStoreError('storage_unavailable')
+    return restore_policy(receipt['policy'])
+
+
+def content_readable(db, session_id, *, conn=None, allow_grant=True):
+    """Whether *session_id*'s stored content may be read here: it is unlocked, or this thread holds an
+    owner grant on this same ``db`` for its owner."""
+    if conn is None:
+        with db._read_ctx() as reader, content_snapshot(reader):
+            return content_readable(db, session_id, conn=reader, allow_grant=allow_grant)
+    owner, locked = _locked_owner(conn, session_id)
+    if not locked:
+        return True
+    grant = _OWNER_GRANT.get() if allow_grant else None
+    return grant is not None and grant[0] is db and owner is not None and owner == grant[1]
+
+
+def require_content(db, session_id, *, conn=None, allow_grant=True):
+    """Raise ``RouteLockedContent`` unless :func:`content_readable`."""
+    if not content_readable(db, session_id, conn=conn, allow_grant=allow_grant):
+        raise RouteLockedContent('route_lock_mismatch', field='content', detail='this session is route-locked')
+
+
+@contextmanager
+def owner_content_grant(db, session_id):
+    """Grant this block the stored content of *session_id*'s local owner, on *db* only. Use it at an owner
+    replay or resume call site, after the turn or view was admitted for that session. The grant covers
+    the owner's compression segments and nothing else: another locked session, or the same id on another
+    SessionDB instance, stays denied."""
+    with db._read_ctx() as conn:
+        owner, _ = _locked_owner(conn, session_id)
+    token = _OWNER_GRANT.set((db, owner) if owner is not None else None)
+    try:
+        yield
+    finally:
+        _OWNER_GRANT.reset(token)
 
 
 def end_idle_local_session(db, *, epoch, session_id, target_id, reason):

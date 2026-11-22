@@ -10,6 +10,7 @@ method's docstring names its storage-interface port.
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Optional
@@ -160,6 +161,27 @@ class SessionStoredReadsMixin:
                 if began and conn.in_transaction:
                     conn.execute('ROLLBACK')
 
+    def _read_content_snapshot(self, read):
+        """Run a read-only composition with authorization on its pinned SQLite generation."""
+        from hermes_state_local import content_snapshot
+
+        def pinned(conn):
+            pins = _pins()
+            existing = pins.get(id(self))
+            if existing is not None and not conn.in_transaction:
+                raise sqlite3.OperationalError('disk I/O error: read snapshot ended')
+            with content_snapshot(conn):
+                pins[id(self)] = conn
+                try:
+                    value = read(conn)
+                    if not conn.in_transaction:
+                        raise sqlite3.OperationalError('disk I/O error: read snapshot ended')
+                    return value
+                finally:
+                    if existing is None:
+                        pins.pop(id(self), None)
+        return self._read_retrying_ioerr(pinned)
+
     # -- the display set -----------------------------------------------------------------------------
 
     def _with_removed_identities(self, rows, session_ids: list[str], conn=None) -> list[Any]:
@@ -256,8 +278,11 @@ class SessionStoredReadsMixin:
         Storage interface: port as ``transcript_handoff_rows``."""
         if not shown_ids:
             return {}
+        from hermes_state_local import content_snapshot, require_content
         segments = json.dumps(list(segment_ids))
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, content_snapshot(conn):
+            for segment in dict.fromkeys(segment_ids):  # same generation as the rows: a locked segment raises
+                require_content(self, segment, conn=conn)
             shown = conn.execute(_SHOWN_ROWS_SQL, {'segments': segments, 'shown': json.dumps(sorted(set(shown_ids)))}).fetchall()
             uids = {row['_shown_uid'] for row in shown if row['_shown_uid']}
             copies = conn.execute(_HANDOFF_COPIES_SQL, {
@@ -301,7 +326,9 @@ class SessionStoredReadsMixin:
             return []
         sql = _HANDOFF_SHOWN_BEFORE_SQL.format(match=' OR '.join(f'({part})' for part in match), visible=DISPLAY_VISIBLE_SQL,
                                                later=not_a_later_tool_copy_sql('candidate'))
-        with self._read_ctx() as conn:
+        from hermes_state_local import content_snapshot, require_content
+        with self._read_ctx() as conn, content_snapshot(conn):
+            require_content(self, segment, conn=conn)
             rows = conn.execute(sql, {'sid': segment, 'before': int(before), 'uids': json.dumps(uids),
                                       'contents': json.dumps(contents)}).fetchall()
         return [self._row_to_message_dict(row, warn_context='session.transcript', summary_flag=True) for row in rows]
@@ -316,11 +343,14 @@ class SessionStoredReadsMixin:
         display order; the context row is the display row before the page (empty when there is none).
 
         Storage interface: port as ``transcript_segment_page``."""
+        from hermes_state_local import require_content
+
         def read(conn):
             began = not conn.in_transaction  # inside a transcript_read_snapshot: its transaction
             if began:
                 conn.execute('BEGIN')
             try:
+                require_content(self, segment, conn=conn)
                 position = None
                 if after is not None:
                     found = self._transcript_cursor_slot(conn, segment, after[1])
@@ -384,7 +414,10 @@ class SessionStoredReadsMixin:
         the calls that made them.
 
         Storage interface: port as ``transcript_tool_calls_before``."""
-        with self._read_ctx() as conn:
+        from hermes_state_local import content_snapshot, require_content
+        with self._read_ctx() as conn, content_snapshot(conn):
+            for segment in dict.fromkeys(segment_ids):
+                require_content(self, segment, conn=conn)
             return [tuple(row) for row in conn.execute(
                 "SELECT tool_calls, tool_call_uids FROM messages WHERE session_id IN (SELECT value FROM json_each(?))"
                 " AND role = 'assistant' AND tool_calls IS NOT NULL AND id < ? ORDER BY id DESC LIMIT ?",
@@ -415,9 +448,10 @@ class SessionStoredReadsMixin:
 
         Storage interface: port as ``picker_session_facts``."""
         from hermes_state_common import _sql_preview_raw, _sql_session_last_active
+        from hermes_state_local import content_readable, content_snapshot
         from hermes_state_messages import DISPLAY_VISIBLE_SQL
         unlisted_ids = list(unlisted_ids)
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, content_snapshot(conn):
             roots = {row['id']: dict(row) for row in conn.execute(
                 "SELECT id, cwd, git_repo_root FROM sessions WHERE id IN (SELECT value FROM json_each(?))",
                 (_ids(root_ids),)).fetchall()}
@@ -425,9 +459,14 @@ class SessionStoredReadsMixin:
                 f"SELECT s.id, s.git_branch, s.pinned, {_sql_preview_raw('s.id')}, {_sql_session_last_active('s')} "
                 "AS last_active FROM sessions s WHERE s.id IN (SELECT value FROM json_each(?))",
                 (_ids(unlisted_ids),)).fetchall()} if unlisted_ids else {}
+            # A route-locked, ungranted segment keeps its identity but shows no preview or reply text.
+            for sid, row in unlisted.items():
+                if not content_readable(self, sid, conn=conn):
+                    row['_preview_raw'] = ''
             sql = _LAST_REPLIES_SQL.format(visible=DISPLAY_VISIBLE_SQL)
             replies = {segment: [(self._decode_content(content), bool(summary))
                                  for content, summary in conn.execute(sql, (segment,))]
+                       if content_readable(self, segment, conn=conn) else []
                        for segment in set(segment_ids)}
         return roots, unlisted, replies
 

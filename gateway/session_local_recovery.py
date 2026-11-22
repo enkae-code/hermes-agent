@@ -304,8 +304,23 @@ def _fit_archive(live_rows, display):
     return kept[::-1], truncated
 
 
+def viewer_grant(authority, actor, ref):
+    """Owner content grant for a viewer who IS the local session's owner. An operator passes ``authorize`` but
+    gets no grant, so a route-locked session's history stays refused to them (RouteLockedContent). Call after
+    ``authorize(actor, ref, 'session:read')``."""
+    from contextlib import nullcontext
+    from gateway.owner_identity import same_owner
+    from hermes_state_local import owner_content_grant
+    live = authority.sessions.get(ref.session_id)
+    source = None if live is None else live.source
+    if source is None or source.platform != Platform.LOCAL or not same_owner(source.user_id, actor.subject):
+        return nullcontext()
+    return owner_content_grant(authority.db, ref.session_id)
+
+
 async def prepare_history(authority, ref):
-    """``local_history``'s lineage read, off the owner loop; the locked part re-reads only the live tip."""
+    """``local_history``'s lineage read, off the owner loop; the locked part re-reads only the live tip.
+    Runs under the caller's ``viewer_grant`` (``to_thread`` copies the context)."""
     target = transcript_target(authority, ref)
     return target, await asyncio.to_thread(display_rows, authority.db, target)
 

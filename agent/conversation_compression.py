@@ -1592,7 +1592,9 @@ def _adopt_live_compression_child(
     child = row_getter(session_db, child_session_id)
     if not isinstance(child, dict) or child.get("ended_at") is not None:
         return None
-    recovered = loader(session_db, child_session_id)
+    from agent.turn_facade_lease import owner_grant
+    with owner_grant(session_db, parent_session_id):  # the stale parent's owner; its live child is the same lineage
+        recovered = loader(session_db, child_session_id)
     if not (isinstance(recovered, list) and recovered):
         return None
     # Revalidate after loading: the tip may have rotated or a competing
@@ -2812,7 +2814,9 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
     durable_loader = getattr(type(lease.db), "get_messages_as_conversation", None)
     if not callable(durable_loader):
         return None
-    durable_parent = durable_loader(lease.db, lease.sid)
+    from agent.turn_facade_lease import owner_grant
+    with owner_grant(lease.db, lease.sid):  # the compression lease on lease.sid is held
+        durable_parent = durable_loader(lease.db, lease.sid)
     if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
         return None
     # In-memory carries this turn's un-persisted user tail; flush it via the normal
@@ -2839,7 +2843,8 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
         )
         return None
     # Re-read after the flush so the adopted snapshot carries the just-persisted tail.
-    durable_parent = durable_loader(lease.db, lease.sid, include_row_ids=True)
+    with owner_grant(lease.db, lease.sid):
+        durable_parent = durable_loader(lease.db, lease.sid, include_row_ids=True)
     if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
         return None
     adopted_row_ids = [rid for m in durable_parent if isinstance(rid := m.pop("_row_id", None), int)]

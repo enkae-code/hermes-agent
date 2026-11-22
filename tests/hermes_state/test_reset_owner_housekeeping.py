@@ -30,6 +30,7 @@ def _store_reset(db, epoch, sid):
 @pytest.mark.parametrize('sweep', ['retention', 'empty'])
 @pytest.mark.parametrize('producer', ['canonical', 'session_store'])
 def test_sweeps_keep_the_owner_a_retained_reset_child_needs(tmp_path, producer, sweep):
+    from hermes_state_local import owner_content_grant
     from hermes_state_local_lineage import local_physical_target
     with closing(SessionDB(tmp_path / 'state.db')) as db:
         epoch = rt.begin_runtime_epoch(db, instance_id='owner')
@@ -48,7 +49,8 @@ def test_sweeps_keep_the_owner_a_retained_reset_child_needs(tmp_path, producer, 
         swept = db.prune_sessions(older_than_days=90) if sweep == 'retention' else db.delete_empty_sessions()
         assert swept == 1 and db.get_session('stray') is None
         assert db.get_session(sid) is not None
-        assert [m['content'] for m in db.get_messages(child)] == ['hi', 'hello']
+        with owner_content_grant(db, sid):  # the test plays the owner for its own content assertion
+            assert [m['content'] for m in db.get_messages(child)] == ['hi', 'hello']
         with db._read_ctx() as conn:
             assert local_physical_target(conn, sid) == child
         admitted = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id=sid,

@@ -46,11 +46,20 @@ def db(tmp_path, monkeypatch):
     db.close()
 
 
+def _clean_statements(call):
+    """Statements one failure-free run of *call* issues: the contract is clean + 1, whatever a read costs."""
+    _STATE.update(failures_left=0, attempts=0)
+    call()
+    clean, _STATE["attempts"] = _STATE["attempts"], 0
+    return clean
+
+
 def test_transient_ioerr_on_pooled_read_is_retried_on_the_same_connection(db):
+    clean = _clean_statements(lambda: db.get_session("s"))
     _STATE["failures_left"] = 1
     row = db.get_session("s")
     assert row is not None and row["id"] == "s"
-    assert _STATE["attempts"] == 2  # one failure, one replay
+    assert _STATE["failures_left"] == 0 and _STATE["attempts"] == clean + 1  # one failure, one replay
     assert db._db_corrupt is False and db._db_wal_generation_lost is False
 
 
@@ -68,8 +77,10 @@ def test_transient_ioerr_on_get_messages_is_retried(db, include_compacted, fail_
     db.append_message("s", "user", "hi")
     # "WITH page AS" names the display CTE itself: _ensure_display_order's SELECT probe runs first and must not
     # absorb the failure, and a reshaped query that no longer runs through the retrying reader fails loudly.
-    _STATE.update(failures_left=1, attempts=0, fail_prefix=fail_prefix)
+    _STATE["fail_prefix"] = fail_prefix
+    clean = _clean_statements(lambda: db.get_messages("s", include_compacted=include_compacted))
+    _STATE["failures_left"] = 1
     rows = db.get_messages("s", include_compacted=include_compacted)
     assert [r["content"] for r in rows] == ["hi"]
-    assert _STATE["failures_left"] == 0 and _STATE["attempts"] == 2  # one failure, one replay
+    assert _STATE["failures_left"] == 0 and _STATE["attempts"] == clean + 1  # one failure, one replay
     assert db._db_corrupt is False and db._db_wal_generation_lost is False
