@@ -57,7 +57,7 @@ def _read(path: Path) -> str:
 
 def emitted_event_names() -> set[str]:
     names: set[str] = set()
-    for src in (REPO / current_path("tui_gateway")).glob("*.py"):
+    for src in (REPO / current_path("tui_gateway")).rglob("*.py"):
         text = _read(src)
         names.update(_LITERAL_EMIT.findall(text))
         names.update(_LITERAL_FRAME.findall(text))

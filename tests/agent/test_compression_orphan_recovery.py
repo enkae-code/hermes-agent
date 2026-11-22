@@ -21,6 +21,20 @@ def test_recover_rotated_compression_session_reopens_legacy_orphan(tmp_path):
         db.close()
 
 
+def test_recover_rotated_compression_session_adopts_locked_owner_child(tmp_path):
+    from hermes_state_local import content_readable
+    from tests.test_route_lock_content_boundary import _record
+
+    with SessionDB(tmp_path / "state.db") as db:
+        parent, child = _record(db, tmp_path, "compression-owner", descendant=True)
+        agent = SimpleNamespace(_session_db=db, session_id=parent, context_compressor=None, _memory_manager=None)
+        assert not content_readable(db, child)
+        recovered = recover_rotated_compression_session(agent)
+        assert recovered and recovered[-1]["content"] == "tip-compression-owner"
+        assert agent.session_id == child
+        assert not content_readable(db, child)
+
+
 def test_recover_rotated_compression_session_keeps_parent_closed_with_child(
     tmp_path,
 ):

@@ -7,6 +7,7 @@ server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 import contextlib
 
 from ..method_ctx import HandlerRegistry, bind_module
+from .branch_rows import _persist_branch as _persist_branch  # Keep the old import path.
 
 _registry = HandlerRegistry()
 method = _registry.method

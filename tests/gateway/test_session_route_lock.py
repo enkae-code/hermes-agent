@@ -565,6 +565,8 @@ async def test_the_getter_reports_the_frozen_route_and_reads_nothing_else(
 
 @pytest.mark.asyncio
 async def test_no_exported_surface_carries_the_key_or_its_identity(owner):
+    from hermes_state_local import RouteLockedContent
+
     ref = owner.create(fallback="none")
     sid = ref.session_id
     lock = json.loads(owner.policy(ref).route_lock_json)
@@ -580,7 +582,8 @@ async def test_no_exported_surface_carries_the_key_or_its_identity(owner):
     for key in ("runtime_policy", "full", "mtime", "model", "project"):
         surfaces.append(await owner.call("config.get", session_id=sid, key=key))
     surfaces.append(await owner.call("session.list"))
-    surfaces.append(owner.authority.db.export_session(sid))
+    with pytest.raises(RouteLockedContent):
+        owner.authority.db.export_session(sid)
     surfaces.append(
         await owner.call("session.events.since", session_id=sid, sequence=0)
     )
