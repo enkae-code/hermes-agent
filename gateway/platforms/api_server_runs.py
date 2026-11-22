@@ -765,6 +765,18 @@ async def _admit_run_to_authority(
     return None
 
 
+async def _resolve_and_fence_session(self, selected_session_id, run_id):
+    """Live-tip resolution, then the route-lock fence for the session the run would write to, whatever
+    history the caller sent -> ``(session_id, refusal_or_None)``; a refusal releases the run's owner slot."""
+    if not selected_session_id:
+        return selected_session_id, None
+    selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+    refused = await self._route_lock_refusal(str(selected_session_id))
+    if refused is not None:
+        self._run_owners.pop(run_id, None)
+    return selected_session_id, refused
+
+
 async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
@@ -836,12 +848,9 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
     # history loads from it, the turn writes to it, and a detached delivery row persisted to it
     # is what the next same-id run consumes below.
-    if selected_session_id:
-        selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
-        # Route-lock fence for the session the run would write to, whatever history the caller sent.
-        if (refused := await self._route_lock_refusal(str(selected_session_id))) is not None:
-            self._run_owners.pop(run_id, None)
-            return refused
+    selected_session_id, refused = await _resolve_and_fence_session(self, selected_session_id, run_id)
+    if refused is not None:
+        return refused
     session_id = selected_session_id or run_id
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next

@@ -863,6 +863,81 @@ class OpenAICompatRoutesMixin:
         agent_task.add_done_callback(_done)
         return agent_task, agent_ref
 
+    async def _require_route_unlocked(self, session_id: str) -> None:
+        """Route-lock fence for every API turn/copy on *session_id* (its whole compression lineage):
+        raises ``RuntimeStoreError`` — ``route_lock_mismatch`` for a locked session, else
+        ``storage_unavailable`` when the policy cannot be verified. Never degrades to an empty history."""
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return
+        from hermes_state_local import require_legacy_execution
+        try:
+            await asyncio.to_thread(require_legacy_execution, db, session_id, allow_unpersisted=True)
+        except RuntimeStoreError:
+            raise
+        except Exception as exc:
+            raise RuntimeStoreError("storage_unavailable") from exc
+
+    async def _route_lock_refusal(self, session_id: str) -> Optional[web.Response]:
+        """``_require_route_unlocked`` as the HTTP refusal (409 / 503), or ``None`` when runnable."""
+        try:
+            await self._require_route_unlocked(session_id)
+        except RuntimeStoreError as exc:
+            from gateway.platforms.api_server import _openai_error
+            from gateway.platforms.api_server_authority_runs import store_error_response
+            return store_error_response(_openai_error, exc)
+        return None
+
+    async def _conversation_history_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return []
+        await self._require_route_unlocked(session_id)
+        try:
+            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+        except RuntimeStoreError:
+            raise
+        except Exception as exc:  # health: allow BLE001 -- moved as-is: a failed read degrades to no history; the route-lock fence above already ran
+            logger.warning("Failed to load session history for %s: %s", session_id, exc)
+            return []
+
+    async def _resume_chat_session(self, provided_session_id: str, history: list):
+        """``X-Hermes-Session-Id`` continuation -> ``(session_id, history, refusal_or_None)``; the route-lock
+        fence runs inside ``_conversation_history_for_session``."""
+        from gateway.platforms.api_server import _openai_error
+        session_id = provided_session_id
+        try:
+            db = await self._ensure_session_db_async()
+            if db is not None:
+                # #98619/#13437: a client-addressed id from before a compression rotation
+                # must adopt the live continuation tip — history loads from it, the turn and
+                # the wake target bind it, and a detached delegation delivery row persisted
+                # on the tip is what this continuation consumes. Same canonical resolution
+                # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
+                from gateway.platforms.api_server_runs import _resolve_live_session_id
+                session_id = await _resolve_live_session_id(self, provided_session_id)
+                history = await self._conversation_history_for_session(session_id)
+        except Exception as exc:  # health: allow BLE001 -- fail-closed: unresolvable/unverifiable/locked refuses, never a turn on the raw id
+            if not isinstance(exc, RuntimeStoreError):
+                logger.warning("Failed to resolve session %s: %s", provided_session_id, exc)
+                exc = RuntimeStoreError("storage_unavailable")
+            from gateway.platforms.api_server_authority_runs import store_error_response
+            return session_id, history, store_error_response(_openai_error, exc)
+        return session_id, history, None
+
+    async def _fence_named_sessions(self, body: dict, gateway_session_key, previous_response_id) -> None:
+        """Route-lock fence for the sessions a /v1/responses request can name, before ``prepare_context``
+        may write an admission; raises ``RuntimeStoreError``."""
+        response_store = self._current_response_store()
+        previous = body.get('conversation') and await response_store.off_loop(
+            response_store.get_conversation, body['conversation']) or previous_response_id
+        stored = previous and await response_store.off_loop(response_store.get, previous)
+        declared = gateway_session_key and await asyncio.to_thread(
+            self._declared_conversation_session, gateway_session_key)
+        for named in (stored and stored.get('session_id'), declared):
+            if named:
+                await self._require_route_unlocked(named)
+
     async def _handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         from gateway.platforms.api_server import (
@@ -914,24 +989,9 @@ class OpenAICompatRoutesMixin:
                 return _invalid_request("Invalid session ID")
             if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
                 return _invalid_request("Session ID too long")
-            session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    # #98619/#13437: a client-addressed id from before a compression rotation
-                    # must adopt the live continuation tip — history loads from it, the turn and
-                    # the wake target bind it, and a detached delegation delivery row persisted
-                    # on the tip is what this continuation consumes. Same canonical resolution
-                    # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
-                    from gateway.platforms.api_server_runs import _resolve_live_session_id
-                    session_id = await _resolve_live_session_id(self, provided_session_id)
-                    history = await self._conversation_history_for_session(session_id)  # route-lock fence
-            except Exception as exc:  # unresolvable/unverifiable/locked: refuse, never a turn on the raw id
-                if not isinstance(exc, RuntimeStoreError):
-                    logger.warning("Failed to resolve session %s: %s", provided_session_id, exc)
-                    exc = RuntimeStoreError("storage_unavailable")
-                from gateway.platforms.api_server_authority_runs import store_error_response
-                return store_error_response(_openai_error, exc)
+            session_id, history, refused = await self._resume_chat_session(provided_session_id, history)
+            if refused is not None:
+                return refused
         else:
             # Stable id from the conversation fingerprint so Open WebUI-style clients map onto
             # one Hermes session; namespaced by the routed profile (#123989).
@@ -1405,16 +1465,7 @@ class OpenAICompatRoutesMixin:
         from gateway.platforms.api_server_response_admissions import prepare_context
         from hermes_state_runtime import RuntimeStoreError
         try:
-            # The sessions the request can name are fenced BEFORE prepare_context may write an admission.
-            response_store = self._current_response_store()
-            previous = body.get('conversation') and await response_store.off_loop(
-                response_store.get_conversation, body['conversation']) or previous_response_id
-            stored = previous and await response_store.off_loop(response_store.get, previous)
-            declared = gateway_session_key and await asyncio.to_thread(
-                self._declared_conversation_session, gateway_session_key)
-            for named in (stored and stored.get('session_id'), declared):
-                if named:
-                    await self._require_route_unlocked(named)
+            await self._fence_named_sessions(body, gateway_session_key, previous_response_id)
             context, error = await prepare_context(
                 self, request, body, gateway_session_key, durable_key, idempotency_scope, idempotency_key)
         except RuntimeStoreError as exc:

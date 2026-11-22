@@ -43,6 +43,7 @@ from agent.model_metadata import estimate_messages_tokens_rough, estimate_reques
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 from agent.usage_anchor import set_usage_anchor
 from hermes_state_ids import new_session_id as mint_session_id
+from hermes_state_local import read_owned_compression_history
 from hermes_state_pidns import holder_namespace_token
 from agent.conversation_compression_watermark import held_archive_watermark
 
@@ -1592,9 +1593,7 @@ def _adopt_live_compression_child(
     child = row_getter(session_db, child_session_id)
     if not isinstance(child, dict) or child.get("ended_at") is not None:
         return None
-    from agent.turn_facade_lease import owner_grant
-    with owner_grant(session_db, parent_session_id):  # the stale parent's owner; its live child is the same lineage
-        recovered = loader(session_db, child_session_id)
+    recovered = read_owned_compression_history(loader, session_db, parent_session_id, child_session_id)
     if not (isinstance(recovered, list) and recovered):
         return None
     # Revalidate after loading: the tip may have rotated or a competing
@@ -2814,9 +2813,7 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
     durable_loader = getattr(type(lease.db), "get_messages_as_conversation", None)
     if not callable(durable_loader):
         return None
-    from agent.turn_facade_lease import owner_grant
-    with owner_grant(lease.db, lease.sid):  # the compression lease on lease.sid is held
-        durable_parent = durable_loader(lease.db, lease.sid)
+    durable_parent = read_owned_compression_history(durable_loader, lease.db, lease.sid, lease.sid)
     if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
         return None
     # In-memory carries this turn's un-persisted user tail; flush it via the normal
@@ -2842,9 +2839,7 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
             lease.sid, len(messages), len(durable_parent),
         )
         return None
-    # Re-read after the flush so the adopted snapshot carries the just-persisted tail.
-    with owner_grant(lease.db, lease.sid):
-        durable_parent = durable_loader(lease.db, lease.sid, include_row_ids=True)
+    durable_parent = read_owned_compression_history(durable_loader, lease.db, lease.sid, lease.sid, include_row_ids=True)
     if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
         return None
     adopted_row_ids = [rid for m in durable_parent if isinstance(rid := m.pop("_row_id", None), int)]

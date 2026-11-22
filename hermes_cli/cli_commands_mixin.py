@@ -824,10 +824,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         # observe, and unblocking the card could dispatch a competing worker. Keep the
         # CURRENT session instead of switching.
         from hermes_cli.kanban_resume_guard import kanban_resume_refusal
-        if (kanban_refusal := kanban_resume_refusal(self._session_db, target_id)):
-            return _cp(f"  {kanban_refusal}")
-        if (locked := _route_lock_refusal(self._session_db, target_id)):  # stays on the current session
-            return _cp(f"  {locked}")
+        if refusal := kanban_resume_refusal(self._session_db, target_id) or _route_lock_refusal(self._session_db, target_id):
+            return _cp(f"  {refusal}")
         # One session.resume, before anything changes: it subscribes the target and names its receipt
         # owner; a target the gateway refuses this viewer stops the switch, so the current session is
         # neither ended nor swapped for one whose next prompt would be refused.
@@ -919,10 +917,8 @@ class CLICommandsMixin(CLICommandsSessionToolsMixin):
         from cli import _sync_process_session_id
         if not self.conversation_history:
             return _cp(f"  {_gt('branch.no_conversation')}")
-        if not self._session_db:
-            return _cp(_db_unavailable_line())
-        if (locked := _route_lock_refusal(self._session_db, self.session_id, allow_unpersisted=True)):  # no copy
-            return _cp(f"  {locked}")
+        if not self._session_db or (locked := _route_lock_refusal(self._session_db, self.session_id, allow_unpersisted=True)):
+            return _cp(f"  {locked}" if self._session_db else _db_unavailable_line())
         # CLI has no threads: always in place; strip the gateway's ``--here`` so it is never a title.
         from gateway.slash_commands_branch_thread import parse_branch_args
         _, branch_name = parse_branch_args(_command_arg(cmd_original))

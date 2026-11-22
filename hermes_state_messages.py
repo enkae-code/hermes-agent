@@ -26,6 +26,7 @@ from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_too
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_stored_reads import SessionStoredReadsMixin
+from hermes_state_local import content_snapshot, content_sql_filter, read_lineage, require_content
 from hermes_state_identity import (
     _absorbed_uids_json, _restore_identity_columns, _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list)
 
@@ -1266,8 +1267,6 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
     def _legacy_display_page(self, session_id: str, *, active_clause: str, limit: Optional[int], offset: int,
                              latest: bool) -> list[Any]:
         """Project a legacy read-only display page without retaining transcript payloads."""
-        from hermes_state_local import content_snapshot
-
         representatives: dict[bytes, tuple[int, int]] = {}
         with self._read_ctx() as conn:
             with content_snapshot(conn):
@@ -1391,8 +1390,6 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         the full transcript spans parent sessions, not just the child continuation (#51058).
 
         Storage interface: port as ``get_messages`` (its lineage display read is ``display_set``)."""
-        from hermes_state_local import require_content
-
         if after_id is not None and (latest or offset):
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
@@ -1402,16 +1399,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         indexed = (include_compacted and not include_inactive and
                    (self._read_content_snapshot(lambda conn: require_content(self, session_id, conn=conn)) is None)
                    and self._ensure_display_order(session_id))
-
-        def read(conn):
-            # Ancestor expansion uses the resume lineage (explicit /branch copies stay single-session).
-            session_ids = self._resume_lineage_ids(session_id) if include_ancestors else [session_id]
-            for sid in session_ids:
-                require_content(self, sid, conn=conn)
-            return self._get_message_rows(session_id, session_ids, include_inactive, include_compacted,
-                                          indexed, limit, offset, latest, after_id)
-
-        rows = self._read_content_snapshot(read)
+        rows = read_lineage(self, session_id, ancestors=include_ancestors, fetch=lambda ids: self._get_message_rows(
+            session_id, ids, include_inactive, include_compacted, indexed, limit, offset, latest, after_id))
         return [self._row_to_message_dict(row, warn_context="get_messages", summary_flag=True) for row in rows]
 
     def _get_message_rows(self, session_id, session_ids, include_inactive, include_compacted,
@@ -1452,8 +1441,6 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
 
     def find_pr_url_messages(self, session_ids: list[str]) -> list[dict[str, Any]]:
         """Tool results containing ``/pull/``: a deliberately loose scan, oldest-first so the caller takes the last."""
-        from hermes_state_local import content_sql_filter
-
         ids = [s for s in session_ids if s]
         if not ids:
             return []
@@ -1469,8 +1456,6 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
     def get_messages_around(self, session_id: str, around_message_id: int, window: int = 5) -> dict[str, Any]:
         """Up to *window* messages either side of an anchor id (ascending). ``messages_before``/``_after`` count
         strictly around the anchor (fewer than *window* = session boundary). Empty for a foreign anchor."""
-        from hermes_state_local import content_snapshot, require_content
-
         window = max(window, 0)
         with self._read_ctx() as conn, content_snapshot(conn):
             require_content(self, session_id, conn=conn)
@@ -1551,19 +1536,10 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         repairs the loaded list for LIVE REPLAY callers (a durable ``user;user`` pair would re-trigger the
         per-request repair forever), preserving summary markers before repair so derivative context
         cannot merge with an original user turn; the stored transcript is never mutated."""
-        from hermes_state_local import require_content
-
         display = include_compacted and not include_inactive  # removed rows too: see drop_removed
-
-        def read(conn):
-            ids = self._resume_lineage_ids(session_id) if include_ancestors else [session_id]
-            for sid in ids:
-                require_content(self, sid, conn=conn)
-            return self._fetch_conversation_rows(
-                ids, self._active_clause(include_inactive, include_compacted),
-                with_session_id=False, with_compacted=display)
-
-        rows = self._read_content_snapshot(read)
+        rows = read_lineage(self, session_id, lambda ids: self._fetch_conversation_rows(
+            ids, self._active_clause(include_inactive, include_compacted),
+            with_session_id=False, with_compacted=display), ancestors=include_ancestors)
         if include_compacted:
             rows = self._dedupe_display_generations(rows, drop_removed=display)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
@@ -1712,15 +1688,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         read as deleted even though every row is still on disk, and the REST transcript read (which has
         always included them) disagreed with this one about the same session (#92080).
         """
-        from hermes_state_local import require_content
-
-        def read(conn):
-            ids = self._resume_lineage_ids(session_id)
-            for sid in ids:
-                require_content(self, sid, conn=conn)
-            return self._fetch_conversation_rows(ids, "", with_session_id=True, with_compacted=True)
-
-        rows = self._read_content_snapshot(read)
+        rows = read_lineage(self, session_id, lambda ids: self._fetch_conversation_rows(
+            ids, "", with_session_id=True, with_compacted=True))
         # The model projection stays active-only: it is the compressed working context. The gateway's
         # first-turn ``session_meta`` marker (tools/model/platform bookkeeping) is transcript logging,
         # never LLM input: a resuming surface that fed it to the agent would count it in the history
@@ -1799,16 +1768,8 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         """Ancestor-only display messages of a lineage (row ``session_id != tip``) that ``session.resume``
         prepends. Identified by row origin, not ``display[:len(display) - len(model)]``, so alternation
         repair cannot overcount."""
-        from hermes_state_local import require_content
-
-        def read(conn):
-            ids = self._resume_lineage_ids(session_id)
-            for sid in ids:
-                require_content(self, sid, conn=conn)  # before the length probe: no empty-vs-content oracle
-            return ids, (self._fetch_conversation_rows(ids, "", with_session_id=True, with_compacted=True)
-                         if len(ids) > 1 else [])
-
-        session_ids, fetched = self._read_content_snapshot(read)
+        session_ids, fetched = read_lineage(self, session_id, lambda ids: (ids, self._fetch_conversation_rows(
+            ids, "", with_session_id=True, with_compacted=True) if len(ids) > 1 else []))
         if len(session_ids) <= 1:
             return []
         rows = self._dedupe_display_generations(fetched, drop_removed=True)

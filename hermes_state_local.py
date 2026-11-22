@@ -1,4 +1,5 @@
 """Private local creation receipts in the canonical runtime transaction owner."""
+import functools
 import json
 import sqlite3
 import threading
@@ -6,6 +7,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Any, Callable, Optional
 
 from hermes_state_runtime import RuntimeStoreError, _epoch, _json
 
@@ -268,7 +270,7 @@ def _receipt_locked(raw):
         policy = _receipt(raw)['policy']
         return (is_locked(SimpleNamespace(route_lock_json=policy.get('route_lock_json')))
                 or json.loads(policy['request_json']).get('fallback') == 'none')
-    except Exception:
+    except Exception:  # health: allow BLE001 -- lock classifier: any unreadable receipt counts as locked (fail closed)
         return True
 
 
@@ -604,7 +606,7 @@ def _locked_owner(conn, session_id):
         return owned[0], is_locked(_owned_policy(conn, row, *owned))
     except sqlite3.Error:
         raise
-    except Exception:
+    except Exception:  # health: allow BLE001 -- lock classifier: an unverifiable receipt is locked with no owner (fail closed)
         return None, True
 
 
@@ -683,3 +685,91 @@ def end_idle_local_session(db, *, epoch, session_id, target_id, reason):
         return db._end_and_bump(conn, 'UPDATE sessions SET ended_at=?, end_reason=? WHERE id=? AND ended_at IS NULL',
                                 (time.time(), reason, target_id), target_id, reason)
     return db._execute_write(write)
+
+
+def read_owned_compression_history(loader, db, owner_sid, target_sid, **kwargs):
+    """Read one compression segment under the already-authorized owner's grant."""
+    from agent.turn_facade_lease import owner_grant
+
+    with owner_grant(db, owner_sid):
+        return loader(db, target_sid, **kwargs)
+
+
+def read_lineage(db, session_id, fetch, *, ancestors=True):
+    """``fetch(ids)`` on one read snapshot after every segment of *session_id*'s resume lineage (just
+    *session_id* unless *ancestors*: explicit /branch copies stay single-session) passed ``require_content``,
+    so no row is probed, counted or fetched before the whole lineage is authorized (no empty-vs-content oracle)."""
+    def read(conn):
+        ids = db._resume_lineage_ids(session_id) if ancestors else [session_id]
+        for sid in ids:
+            require_content(db, sid, conn=conn)
+        return fetch(ids)
+    return db._read_content_snapshot(read)
+
+
+@functools.cache
+def _local_candidate_sql() -> str:
+    """SQL predicate (``s`` = sessions): this row MAY hold a local receipt (a receipt key, or the canonical route/origin marker).
+    A superset of ``_legacy_policy_owner``'s candidacy: a false positive only costs the
+    classification, a false negative would leak, so the markers are matched loosely. A row that is not a
+    candidate is not route-locked and needs no further statement."""
+    keys = ', '.join(f"'{prefix}' || s.{col}" for prefix in (POLICY_PREFIX, _legacy_prefix()) for col in ('id', 'chat_id'))
+    return (f"(EXISTS (SELECT 1 FROM state_meta WHERE key IN ({keys})) OR s.session_key LIKE 'agent:%:local%'"
+            " OR COALESCE(s.origin_json, '') LIKE '%local%')")
+
+
+class RouteGatedReads:
+    """SessionDB session reads that classify route locks on their own read snapshot (mixed into ``SessionSessionsMixin``)."""
+
+    def _read_session_gated(self, sql: str, params: Any = ()) -> tuple[Optional[dict[str, Any]], bool]:
+        """``(row dict, locked)`` of one ``SELECT ..., <_local_candidate_sql()> AS _rc`` (``s`` = sessions; the
+        row must carry ``id``): the row and its route-lock classification in ONE read snapshot. A row that is
+        not a local candidate costs exactly this one statement; ``locked`` = content not readable here."""
+        def read(conn):
+            with content_snapshot(conn):
+                row = conn.execute(sql, params).fetchone()
+                if row is None:
+                    return None, False
+                data = dict(row)
+                candidate = data.pop("_rc")
+                return data, bool(candidate) and not content_readable(self, data["id"], conn=conn)
+        return self._read_retrying_ioerr(read)
+
+    def _locked_ids(self, conn, ids) -> set[str]:
+        """Which of *ids* are route-locked and ungranted on *conn*'s snapshot (candidates only are classified)."""
+        from hermes_state_common import _id_chunks, _placeholders
+
+        locked: set[str] = set()
+        for chunk in _id_chunks(dict.fromkeys(i for i in ids if i), 400):
+            for (sid,) in conn.execute(
+                    f"SELECT s.id FROM sessions s WHERE s.id IN ({_placeholders(chunk)}) AND {_local_candidate_sql()}",
+                    chunk).fetchall():
+                if not content_readable(self, sid, conn=conn):
+                    locked.add(sid)
+        return locked
+
+    @staticmethod
+    def _redact_locked(sessions: list[dict[str, Any]], locked: set[str], *, exclude: bool = False) -> list[dict[str, Any]]:
+        """Blank the content fields (title, preview, prompt) of *locked* rows; identity and lifecycle stay.
+        ``exclude`` drops them instead (title discovery: a locked row must not even be a candidate).
+
+        WARNING: only title, system_prompt and preview are blanked. A caller whose SQL selects, ranks or
+        filters on any other content (message text, tool names, a needle match) must pass ``exclude=True``
+        or gate in SQL with ``route_content_readable(session_id)`` before ranking and LIMIT; redacting
+        after the fact would still leak through order, count or an extra column."""
+        if exclude:
+            return [s for s in sessions if s["id"] not in locked]
+        for s in sessions:
+            if s["id"] in locked:
+                s.update({k: v for k, v in (("title", None), ("system_prompt", None), ("preview", "")) if k in s})
+        return sessions
+
+    def _read_gated(self, sql: str, params: Any = (), shape: Callable = dict, *, exclude: bool = False) -> list[dict[str, Any]]:
+        """``shape(row)`` for each row of *sql* (each shaped row must carry ``id``), with locked sessions redacted
+        (or ``exclude``d), in ONE read snapshot. ``route_content_readable(sid)`` is registered for *sql* so a
+        title/needle match can be gated in SQL before ranking and LIMIT."""
+        def read(conn):
+            with content_sql_filter(self, conn):
+                rows = [shape(r) for r in conn.execute(sql, params).fetchall()]
+                return self._redact_locked(rows, self._locked_ids(conn, [r["id"] for r in rows]), exclude=exclude)
+        return self._read_retrying_ioerr(read)

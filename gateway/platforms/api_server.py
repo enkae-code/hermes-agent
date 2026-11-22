@@ -2497,43 +2497,6 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return None, _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
         return session, None
 
-    async def _require_route_unlocked(self, session_id: str) -> None:
-        """Route-lock fence for every API turn/copy on *session_id* (its whole compression lineage):
-        raises ``RuntimeStoreError`` — ``route_lock_mismatch`` for a locked session, else
-        ``storage_unavailable`` when the policy cannot be verified. Never degrades to an empty history."""
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return
-        from hermes_state_local import require_legacy_execution
-        try:
-            await asyncio.to_thread(require_legacy_execution, db, session_id, allow_unpersisted=True)
-        except RuntimeStoreError:
-            raise
-        except Exception as exc:
-            raise RuntimeStoreError("storage_unavailable") from exc
-
-    async def _route_lock_refusal(self, session_id: str) -> Optional[web.Response]:
-        """``_require_route_unlocked`` as the HTTP refusal (409 / 503), or ``None`` when runnable."""
-        try:
-            await self._require_route_unlocked(session_id)
-        except RuntimeStoreError as exc:
-            from gateway.platforms.api_server_authority_runs import store_error_response
-            return store_error_response(_openai_error, exc)
-        return None
-
-    async def _conversation_history_for_session(self, session_id: str) -> list[dict[str, Any]]:
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return []
-        await self._require_route_unlocked(session_id)
-        try:
-            return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-        except RuntimeStoreError:
-            raise
-        except Exception as exc:
-            logger.warning("Failed to load session history for %s: %s", session_id, exc)
-            return []
-
     async def run_internal_session_turn(self, *, session_id: str, text: str, profile: str,
                                         notification_category: str = "result") -> None:
         """Run one background wake turn against a raw session id IN-PROCESS (no HTTP, no API key);

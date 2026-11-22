@@ -2,7 +2,6 @@
 flags (end/reopen/archive/pin/hide/read), model_config patching, listing and
 counting, delete cascades, and the auto-archive sweep."""
 
-import functools
 import glob
 import json
 import logging
@@ -25,23 +24,10 @@ from hermes_state_common import (
     _source_match_clause, emit_session_deleted, launch_stub_filter_sql,
 )
 from hermes_state_compression import _CHAIN_CAP, _UNSET_CREATED_SQL
+from hermes_state_local import RouteGatedReads, _local_candidate_sql, content_snapshot
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")
-
-
-@functools.cache
-def _local_candidate_sql() -> str:
-    """SQL predicate (``s`` = sessions): this row MAY hold a local receipt (a receipt key, or the canonical route/origin marker).
-    A superset of ``hermes_state_local._legacy_policy_owner``'s candidacy: a false positive only costs the
-    classification, a false negative would leak, so the markers are matched loosely. A row that is not a
-    candidate is not route-locked and needs no further statement."""
-    from hermes_state_local import POLICY_PREFIX
-    from hermes_state_local_migration import LEGACY_PREFIX
-
-    keys = ', '.join(f"'{prefix}' || s.{col}" for prefix in (POLICY_PREFIX, LEGACY_PREFIX) for col in ('id', 'chat_id'))
-    return (f"(EXISTS (SELECT 1 FROM state_meta WHERE key IN ({keys})) OR s.session_key LIKE 'agent:%:local%'"
-            " OR COALESCE(s.origin_json, '') LIKE '%local%')")
 
 
 def workspace_key(row: dict[str, Any]) -> Optional[str]:
@@ -351,7 +337,7 @@ _INHERIT_PARENT_ROUTING_SQL = (
 )
 
 
-class SessionSessionsMixin:
+class SessionSessionsMixin(RouteGatedReads):
     """Session rows: create/inherit, lifecycle flags, model_config, listing, deletion."""
 
     def _own_profile_name(self) -> Optional[str]:
@@ -848,63 +834,6 @@ class SessionSessionsMixin:
         """Persisted YOLO flag; False on any parse failure (resume must never enable the bypass)."""
         return bool(_parse_model_config((session_meta or {}).get("model_config")).get("yolo_mode"))
 
-    def _read_session_gated(self, sql: str, params: Any = ()) -> tuple[Optional[dict[str, Any]], bool]:
-        """``(row dict, locked)`` of one ``SELECT ..., <_local_candidate_sql()> AS _rc`` (``s`` = sessions; the
-        row must carry ``id``): the row and its route-lock classification in ONE read snapshot. A row that is
-        not a local candidate costs exactly this one statement; ``locked`` = content not readable here."""
-        from hermes_state_local import content_readable, content_snapshot
-
-        def read(conn):
-            with content_snapshot(conn):
-                row = conn.execute(sql, params).fetchone()
-                if row is None:
-                    return None, False
-                data = dict(row)
-                candidate = data.pop("_rc")
-                return data, bool(candidate) and not content_readable(self, data["id"], conn=conn)
-        return self._read_retrying_ioerr(read)
-
-    def _locked_ids(self, conn, ids) -> set[str]:
-        """Which of *ids* are route-locked and ungranted on *conn*'s snapshot (candidates only are classified)."""
-        from hermes_state_local import content_readable
-
-        locked: set[str] = set()
-        for chunk in _id_chunks(dict.fromkeys(i for i in ids if i), 400):
-            for (sid,) in conn.execute(
-                    f"SELECT s.id FROM sessions s WHERE s.id IN ({_session_ids_placeholders(chunk)}) AND {_local_candidate_sql()}",
-                    chunk).fetchall():
-                if not content_readable(self, sid, conn=conn):
-                    locked.add(sid)
-        return locked
-
-    @staticmethod
-    def _redact_locked(sessions: list[dict[str, Any]], locked: set[str], *, exclude: bool = False) -> list[dict[str, Any]]:
-        """Blank the content fields (title, preview, prompt) of *locked* rows; identity and lifecycle stay.
-        ``exclude`` drops them instead (title discovery: a locked row must not even be a candidate).
-
-        WARNING: only title, system_prompt and preview are blanked. A caller whose SQL selects, ranks or
-        filters on any other content (message text, tool names, a needle match) must pass ``exclude=True``
-        or gate in SQL with ``route_content_readable(session_id)`` before ranking and LIMIT; redacting
-        after the fact would still leak through order, count or an extra column."""
-        if exclude:
-            return [s for s in sessions if s["id"] not in locked]
-        for s in sessions:
-            if s["id"] in locked:
-                s.update({k: v for k, v in (("title", None), ("system_prompt", None), ("preview", "")) if k in s})
-        return sessions
-
-    def _read_gated(self, sql: str, params: Any = (), shape: Callable = dict, *, exclude: bool = False) -> list[dict[str, Any]]:
-        """``shape(row)`` for each row of *sql* (each shaped row must carry ``id``), with locked sessions redacted
-        (or ``exclude``d), in ONE read snapshot. ``route_content_readable(sid)`` is registered for *sql* so a
-        title/needle match can be gated in SQL before ranking and LIMIT."""
-        from hermes_state_local import content_sql_filter
-
-        def read(conn):
-            with content_sql_filter(self, conn):
-                rows = [shape(r) for r in conn.execute(sql, params).fetchall()]
-                return self._redact_locked(rows, self._locked_ids(conn, [r["id"] for r in rows]), exclude=exclude)
-        return self._read_retrying_ioerr(read)
-
     def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
         """Get a session by ID (drains queued token deltas first so cost readers see exact totals).
         A route-locked, ungranted session keeps identity and lifecycle but not its title or prompt."""
@@ -1354,7 +1283,6 @@ class SessionSessionsMixin:
                 return 1
             return 0
 
-        from hermes_state_local import content_snapshot
         try:
             with self._read_ctx() as conn, content_snapshot(conn):
                 conn.set_progress_handler(_deadline_progress_handler, 1000)
