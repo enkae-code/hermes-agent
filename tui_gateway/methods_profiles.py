@@ -95,20 +95,14 @@ def _clean_revisions(raw: dict) -> dict:
 
 
 def _latest_message_preview(db, session_id):
-    """≤80-char excerpt of the NEWEST active user/assistant message, or "" (roster semantics).
-    Same query shape as ``SessionDB.latest_message_row_id``; keep them in step."""
+    """≤80-char excerpt of the NEWEST active user/assistant message, or "" (roster semantics). A
+    route-locked session, or any failure, reads as "": the shared gated query lives in
+    ``gateway.session_group_controls.latest_message_preview``."""
     try:
-        with db._lock:
-            row = db._conn.execute(
-                "SELECT content FROM messages"
-                " WHERE session_id = ? AND role IN ('user', 'assistant')"
-                " AND active = 1 AND content IS NOT NULL AND TRIM(content) != ''"
-                " ORDER BY id DESC LIMIT 1",
-                (session_id,)).fetchone()
+        with db._read_ctx() as conn, _lazy("hermes_state_local", "content_sql_filter")(db, conn):
+            return _lazy("gateway.session_group_controls", "latest_message_preview")(conn, session_id)
     except Exception:
         return ""
-    text = " ".join(str(row[0] or "").split()).strip() if row else ""
-    return text[:80] + "..." if len(text) > 80 else text
 
 
 def _resurrect_recoverable_canonical(db, profile_path, session_id):

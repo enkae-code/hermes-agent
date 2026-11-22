@@ -196,3 +196,68 @@ async def test_get_projections_refuse_or_withhold_locked_content(env):
         ok = await cli.get(f"/api/sessions/{open_}/messages", headers=AUTH)
         assert ok.status == 200
         assert [m["content"] for m in (await ok.json())["data"]] == ["secret-open", "reply-open"]
+
+
+@pytest.mark.parametrize("failure", [sqlite3.OperationalError("locked"), ValueError("boom")])
+async def test_completions_resolution_failure_refuses_not_empty_history(env, failure):
+    """Any non-store failure resolving the client-supplied id is a 503, never a turn on the raw id."""
+    adapter, db, app, _, open_ = env
+    before = _snapshot(db)
+    with patch("gateway.platforms.api_server_runs._resolve_live_session_id", side_effect=failure):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]},
+                                  headers={**AUTH, "X-Hermes-Session-Id": open_})
+            text = await resp.text()
+    assert resp.status == 503, text
+    assert json.loads(text)["error"]["code"] == "storage_unavailable"
+    assert _snapshot(db) == before
+    adapter._run_agent.assert_not_called()
+
+
+def _admissions(db):
+    with db._read_ctx() as conn:
+        return conn.execute("SELECT * FROM session_admissions").fetchall()
+
+
+@pytest.fixture
+def canonical(api, owner, tmp_path):
+    """The canonical-authority adapter (durable admissions) over a db holding a locked session."""
+    from hermes_state_local import API_DECLARED_PREFIX
+    api._api_key = "sk-secret"
+    locked = _record(owner.db, tmp_path, "locked", lock=True)
+    owner.epoch = begin_runtime_epoch(owner.db, instance_id="first")  # the record's commit began a newer epoch
+    # the registry X-Hermes-Session-Key resolves through
+    owner.db._write_sql("INSERT INTO state_meta(key,value) VALUES(?,?)", (API_DECLARED_PREFIX + "k-locked", locked))
+    app = web.Application()
+    app.router.add_post("/v1/responses", api._handle_responses)
+    return api, owner, app
+
+
+async def test_responses_locked_declared_session_leaves_no_admission(canonical):
+    _, owner, app = canonical
+    before, rows = _snapshot(owner.db), _admissions(owner.db)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/v1/responses", json={"input": "hi"},
+                              headers={**AUTH, "X-Hermes-Session-Key": "k-locked", "Idempotency-Key": "idem-1"})
+        text = await resp.text()
+    assert resp.status == 409, text
+    assert json.loads(text)["error"]["code"] == "route_lock_mismatch"
+    assert _admissions(owner.db) == rows  # fenced before any admission write
+    assert _snapshot(owner.db) == before
+
+
+async def test_responses_open_declared_session_continues(canonical):
+    _, owner, app = canonical
+
+    async def handle(event):
+        from gateway.session_results import execution_result
+        execution_result.get()["result"] = {"final_response": "a", "messages": [
+            {"role": "user", "content": event.text}, {"role": "assistant", "content": "a"}]}
+        return "a"
+    owner.runner._handle_message = handle
+    async with TestClient(TestServer(app)) as cli:
+        for n in (1, 2):  # the second turn resolves the declared key to the first turn's session
+            resp = await cli.post("/v1/responses", json={"input": "hi"},
+                                  headers={**AUTH, "X-Hermes-Session-Key": "k-open", "Idempotency-Key": f"idem-{n}"})
+            assert resp.status == 200, await resp.text()
+    assert len(_admissions(owner.db)) == 2

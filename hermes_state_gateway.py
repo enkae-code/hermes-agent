@@ -569,7 +569,7 @@ class SessionGatewayMixin:
         params: list = [platform] if platform else []
         query += (" AND LOWER(source) = LOWER(?)" if platform else "") + (
             " AND ended_at IS NULL" if active_only else "") + " ORDER BY last_active DESC"
-        return [self._session_row_dict(r) for r in self._read_all(query, params)]
+        return self._read_gated(query, params, self._session_row_dict)  # a locked row keeps its key, not its title/prompt
 
     def find_latest_gateway_session_for_peer(
         self, *, source: str, user_id: Optional[str] = None, session_key: Optional[str] = None,

@@ -1452,14 +1452,19 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
 
     def find_pr_url_messages(self, session_ids: list[str]) -> list[dict[str, Any]]:
         """Tool results containing ``/pull/``: a deliberately loose scan, oldest-first so the caller takes the last."""
+        from hermes_state_local import content_sql_filter
+
         ids = [s for s in session_ids if s]
+        if not ids:
+            return []
         chunks = (ids[start : start + 900] for start in range(0, len(ids), 900))  # SQLite's bound-variable ceiling.
-        return [{"session_id": row[0], "content": row[1]} for chunk in chunks for row in self._read_all(
+        with self._read_ctx() as conn, content_sql_filter(self, conn):
+            return [dict(row) for chunk in chunks for row in conn.execute(
                 f"""SELECT session_id, content FROM messages
                     WHERE session_id IN ({_placeholders(chunk)})
+                      AND route_content_readable(session_id)
                       AND role = 'tool' AND content LIKE '%/pull/%'
-                    ORDER BY id ASC""",
-                chunk)]
+                    ORDER BY id ASC""", chunk)]
 
     def get_messages_around(self, session_id: str, around_message_id: int, window: int = 5) -> dict[str, Any]:
         """Up to *window* messages either side of an anchor id (ascending). ``messages_before``/``_after`` count
@@ -1794,11 +1799,19 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin, 
         """Ancestor-only display messages of a lineage (row ``session_id != tip``) that ``session.resume``
         prepends. Identified by row origin, not ``display[:len(display) - len(model)]``, so alternation
         repair cannot overcount."""
-        session_ids = self._resume_lineage_ids(session_id)
+        from hermes_state_local import require_content
+
+        def read(conn):
+            ids = self._resume_lineage_ids(session_id)
+            for sid in ids:
+                require_content(self, sid, conn=conn)  # before the length probe: no empty-vs-content oracle
+            return ids, (self._fetch_conversation_rows(ids, "", with_session_id=True, with_compacted=True)
+                         if len(ids) > 1 else [])
+
+        session_ids, fetched = self._read_content_snapshot(read)
         if len(session_ids) <= 1:
             return []
-        rows = self._dedupe_display_generations(self._fetch_conversation_rows(
-            session_ids, "", with_session_id=True, with_compacted=True), drop_removed=True)
+        rows = self._dedupe_display_generations(fetched, drop_removed=True)
         ancestor_ids = {int(row["id"]) for row in rows if row["session_id"] != session_id and row["id"] is not None}
         if not ancestor_ids:
             return []

@@ -390,10 +390,24 @@ def _bot_sessions(authority, actor):
                                         lambda: _read_bot_sessions(authority.db, actor.subject, operator))
 
 
+def latest_message_preview(conn, session_id):
+    """≤80-char excerpt of *session_id*'s newest active user/assistant text, or ''. The ONE roster preview
+    query (``profiles.list`` and the unified roster share it); *conn* must be inside ``content_sql_filter``
+    so a route-locked, ungranted session reads as empty."""
+    message = conn.execute(
+        "SELECT content FROM messages WHERE session_id=? AND active=1 "
+        "AND route_content_readable(session_id) "
+        "AND role IN ('user','assistant') AND TRIM(COALESCE(content,''))!='' "
+        "ORDER BY id DESC LIMIT 1", (session_id,)).fetchone()
+    text = ' '.join(str(message[0] or '').split()) if message else ''
+    return text[:80] + '...' if len(text) > 80 else text
+
+
 def _read_bot_sessions(db, subject, operator):
     from hermes_state_local import content_sql_filter
     from hermes_state_local_migration import LEGACY_PREFIX
     from hermes_state_sessions import INTERNAL_LISTING_SOURCES
+    from gateway.owner_identity import same_owner
     hidden_sources = ','.join('?' * len(INTERNAL_LISTING_SOURCES))
     owner_filter, owner_params = ('', ()) if operator else ('user_id=? AND ', (subject,))
     # One read connection for the whole row. A store closed meanwhile (its profile unserved
@@ -402,15 +416,11 @@ def _read_bot_sessions(db, subject, operator):
         def summary(root):
             tip = db._compression_tip_on(conn, root['id'])
             target = conn.execute('SELECT * FROM sessions WHERE id=?', (tip,)).fetchone() or root
-            message = conn.execute(
-                "SELECT content FROM messages WHERE session_id=? AND active=1 "
-                "AND route_content_readable(session_id) "
-                "AND role IN ('user','assistant') AND TRIM(COALESCE(content,''))!='' "
-                "ORDER BY id DESC LIMIT 1", (tip,)).fetchone()
-            text = ' '.join(str(message[0] or '').split()) if message else ''
-            return {'id': root['id'], 'resolved_id': tip, 'title': target['title'] or '',
-                    'root_title': root['title'] or '',
-                    'preview': text[:80] + '...' if len(text) > 80 else text,
+            def title(row):  # a locked row's title is content: only its own owner reads it
+                return (row['title'] or '') if same_owner(row['user_id'], subject) or conn.execute(
+                    'SELECT route_content_readable(?)', (row['id'],)).fetchone()[0] else ''
+            return {'id': root['id'], 'resolved_id': tip, 'title': title(target),
+                    'root_title': title(root), 'preview': latest_message_preview(conn, tip),
                     'started_at': target['started_at'] or 0,
                     'last_active': target['last_activity_at'] or target['started_at'] or 0,
                     'message_count': target['message_count'] or 0}
@@ -419,7 +429,6 @@ def _read_bot_sessions(db, subject, operator):
         # The named registry is not a recency window and canonical chats are hidden.
         canonical = conn.execute(f'SELECT * FROM sessions WHERE title=? AND {_LOCAL_CHAT}',
                                  ('Bot Chat', LEGACY_PREFIX)).fetchone()
-        from gateway.owner_identity import same_owner
         if canonical and (same_owner(canonical['user_id'], subject) or operator) and not canonical['archived']:
             fields['canonical_session'] = summary(canonical)
         # The newest conversation a picker shows: a hidden row (a Bot Chat, group member plumbing)

@@ -244,9 +244,11 @@ class SessionCompressionMixin:
         """The unique live direct child of a compression-ended session, else None. A stale
         agent whose parent was rotated elsewhere may recover only when the lineage names
         exactly one live continuation; more than one fails closed."""
+        from hermes_state_local import content_readable, content_snapshot
+
         if not parent_session_id:
             return None
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, content_snapshot(conn):
             if not _ended_by_compression(conn.execute(_ENDED_ROW_SQL, (parent_session_id,)).fetchone()):
                 return None
             rows = conn.execute(
@@ -266,7 +268,13 @@ class SessionCompressionMixin:
                 """,
                 (parent_session_id,) * 4,
             ).fetchall()
-        return self._session_row_dict(rows[0]) if len(rows) == 1 else None
+            if len(rows) != 1:
+                return None
+            # The row shaper folds _system_prompt_resolved into system_prompt and removes the alias.
+            child = self._session_row_dict(rows[0])
+            if not content_readable(self, child["id"], conn=conn, allow_grant=False):
+                self._redact_locked([child], {child["id"]})
+            return child
 
     def reopen_orphaned_compression_session(self, session_id: str) -> bool:
         """Reopen a compression parent only when no continuation was published (older

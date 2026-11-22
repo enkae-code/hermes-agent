@@ -880,7 +880,12 @@ class SessionSessionsMixin:
     @staticmethod
     def _redact_locked(sessions: list[dict[str, Any]], locked: set[str], *, exclude: bool = False) -> list[dict[str, Any]]:
         """Blank the content fields (title, preview, prompt) of *locked* rows; identity and lifecycle stay.
-        ``exclude`` drops them instead (title discovery: a locked row must not even be a candidate)."""
+        ``exclude`` drops them instead (title discovery: a locked row must not even be a candidate).
+
+        WARNING: only title, system_prompt and preview are blanked. A caller whose SQL selects, ranks or
+        filters on any other content (message text, tool names, a needle match) must pass ``exclude=True``
+        or gate in SQL with ``route_content_readable(session_id)`` before ranking and LIMIT; redacting
+        after the fact would still leak through order, count or an extra column."""
         if exclude:
             return [s for s in sessions if s["id"] not in locked]
         for s in sessions:

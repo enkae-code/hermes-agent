@@ -27,8 +27,11 @@ class SessionTodoResultMixin:
         if max_chars is None:
             from tools.todo_tool import MAX_TODO_RESULT_CHARS
             max_chars = MAX_TODO_RESULT_CHARS
-        session_ids = self._resume_lineage_ids(session_id)
-        with self._read_ctx() as conn:
+        from hermes_state_local import content_snapshot, require_content
+        with self._read_ctx() as conn, content_snapshot(conn):
+            session_ids = self._resume_lineage_ids(session_id)
+            for sid in session_ids:
+                require_content(self, sid, conn=conn)  # a locked session's Todo text is its content
             removed = self._removed_todo_copies(conn, session_ids)
             for sid in reversed(session_ids):
                 before_id = 2**63 - 1

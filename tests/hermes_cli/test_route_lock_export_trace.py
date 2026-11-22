@@ -4,6 +4,7 @@ Real entry points over a real SessionDB with the real locked fixture: the dashbo
 ``hermes sessions export`` command, and ``agent.trace_upload``. Only the HF upload edge is captured.
 """
 import io
+import json
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
@@ -60,6 +61,18 @@ def _refused(resp):
 @pytest.mark.parametrize('suffix', ['/messages', '/timeline', '/messages/around?row_id=1', '/export'])
 def test_dashboard_content_get_refuses_locked(client, stores, suffix):
     _refused(client.get(f'/api/sessions/{stores.locked}{suffix}'))
+
+
+def test_dashboard_pr_scan_excludes_locked_transcripts(client, stores):
+    for sid, number in [(stores.locked, 1), (stores.control, 2)]:
+        stores.db.append_message(sid, role='tool', content=json.dumps({
+            'output': f'https://github.com/example/project/pull/{number}',
+        }))
+    result = client.post('/api/profiles/sessions/pull-requests', json={'ids': [stores.locked, stores.control]})
+    assert result.status_code == 200, result.text
+    assert result.json()['pull_requests'] == {
+        stores.control: {'number': 2, 'url': 'https://github.com/example/project/pull/2'},
+    }
 
 
 def test_dashboard_detail_is_metadata_only(client, stores):

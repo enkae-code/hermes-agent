@@ -92,7 +92,47 @@ POINT_READERS = {
     'export_session': lambda db, sid: db.export_session(sid),
     'export_session_lineage': lambda db, sid: db.export_session_lineage(sid),
     'export_session_for_move': lambda db, sid: db.export_session_for_move(sid),
+    'get_latest_todo_result': lambda db, sid: _todo_reader(db, sid),
+    'get_ancestor_display_prefix': lambda db, sid: _prefix_reader(db, sid),
 }
+
+
+def test_find_pr_url_messages_omits_locked_rows_even_with_owner_grant(db, tmp_path):
+    locked, _ = _record(db, tmp_path, 'pr-locked')
+    opened, _ = _record(db, tmp_path, 'pr-open', lock=False)
+    db.append_message(locked, role='tool', content='https://github.com/example/project/pull/1')
+    db.append_message(opened, role='tool', content='https://github.com/example/project/pull/2')
+    with owner_content_grant(db, locked):
+        assert db.find_pr_url_messages([locked, opened]) == [
+            {'session_id': opened, 'content': 'https://github.com/example/project/pull/2'},
+        ]
+
+
+def _todo_reader(db, sid):
+    _seed_todo(db, sid)
+    return db.get_latest_todo_result(sid)
+
+
+def _seed_todo(db, sid):
+    """One paired Todo result carrying the session's first message as its payload."""
+    if db._read_one("SELECT 1 FROM messages WHERE session_id=? AND tool_name='todo'", (sid,)) is None:
+        marker = db._read_one('SELECT content FROM messages WHERE session_id=? ORDER BY id LIMIT 1', (sid,))['content']
+        db.append_message(sid, role='assistant', content='', tool_calls=[
+            {'id': 't1', 'type': 'function', 'function': {'name': 'todo', 'arguments': '{}'}}])
+        db.append_message(sid, role='tool', tool_call_id='t1', tool_name='todo', content=json.dumps(
+            {'todos': [{'id': '1', 'content': marker, 'status': 'pending'}], 'revision': 1}))
+
+
+def _prefix_reader(db, sid):
+    """Rotate *sid* once (compression), then read the ancestor prefix of its tip."""
+    tip = f'{sid}-pfx'
+    if db._read_one('SELECT 1 FROM sessions WHERE id=?', (tip,)) is None:
+        row = db._read_one('SELECT session_key, chat_id, user_id FROM sessions WHERE id=?', (sid,))
+        db.end_session(sid, 'compression')
+        db.create_session(tip, source='tui', parent_session_id=sid, session_key=row['session_key'],
+                          chat_id=row['chat_id'], user_id=row['user_id'])
+        db.append_message(tip, role='user', content='tip')
+    return db.get_ancestor_display_prefix(tip)
 
 
 # 1. Locked session, no grant: every point reader raises, never returns [] or None.
@@ -307,6 +347,62 @@ def test_grant_for_unlocked_session_opens_nothing(db, tmp_path):
     with owner_content_grant(db, open_):
         with pytest.raises(RouteLockedContent):
             db.get_messages(locked)
+
+
+def test_list_gateway_sessions_redacts_locked_title_and_prompt(db, tmp_path):
+    locked, _ = _record(db, tmp_path, 'lg')
+    open_, _ = _record(db, tmp_path, 'og', lock=False)
+    _titled(db, locked, 'Gateway Locked')
+    _titled(db, open_, 'Gateway Open')
+    db._write_sql('UPDATE sessions SET system_prompt=? WHERE id IN (?,?)', ('PROMPT', locked, open_))
+    rows = {r['id']: r for r in db.list_gateway_sessions(active_only=False)}
+    assert rows[locked]['title'] is None and rows[locked]['system_prompt'] is None  # identity stays, content goes
+    assert rows[open_]['title'] == 'Gateway Open' and rows[open_]['system_prompt'] == 'PROMPT'
+    with owner_content_grant(db, locked):
+        assert {r['id']: r for r in db.list_gateway_sessions(active_only=False)}[locked]['system_prompt'] == 'PROMPT'
+
+
+@pytest.mark.parametrize('locked', [False, True])
+def test_find_live_compression_child_redacts_locked_prompt(db, tmp_path, locked):
+    parent, child = _record(db, tmp_path, 'live', lock=locked, descendant=True)
+    db.update_system_prompt(child, 'resolved child prompt')
+    result = db.find_live_compression_child(parent)
+    assert result['id'] == child
+    assert result['system_prompt'] == (None if locked else 'resolved child prompt')
+    assert '_system_prompt_resolved' not in result
+    if locked:
+        with owner_content_grant(db, parent):
+            assert db.find_live_compression_child(parent)['system_prompt'] is None
+
+
+# TUI callers of get_latest_todo_result / get_ancestor_display_prefix are NOT owner paths: session.resume
+# refuses a locked session (4133) at _resume_guard, before any history or Todo read, so no grant is taken.
+@pytest.mark.parametrize('params', [{'defer_history': True}, {}, {'eager_build': True}])
+def test_tui_resume_of_locked_session_refuses_before_any_reader(db, tmp_path, monkeypatch, params):
+    from tui_gateway import server
+
+    locked, _ = _record(db, tmp_path, 'tr')
+    reads = []
+    for name in ('get_latest_todo_result', 'get_ancestor_display_prefix', 'get_resume_conversations'):
+        monkeypatch.setattr(db, name, lambda *a, _n=name, **k: reads.append(_n))
+    monkeypatch.setattr(server, '_get_db', lambda: db)
+    monkeypatch.setattr(server, '_sessions', {})
+    monkeypatch.setattr(server, '_schedule_agent_build', lambda *a, **k: None)
+    resp = server.handle_request({'id': 'rl', 'method': 'session.resume',
+                                  'params': {'session_id': locked, 'cols': 96, **params}})
+    assert resp['error']['code'] == 4133, resp
+    assert reads == []
+
+
+def test_tui_todo_state_of_locked_session_is_empty_not_a_leak(db, tmp_path):
+    from tui_gateway.tool_progress import _todo_state_from_db
+
+    locked, _ = _record(db, tmp_path, 'tt')
+    open_, _ = _record(db, tmp_path, 'to', lock=False)
+    _seed_todo(db, locked)
+    _seed_todo(db, open_)
+    assert _todo_state_from_db(db, locked) is None  # the reader refused; a non-owner caller gets nothing
+    assert 'secret-to' in json.dumps(_todo_state_from_db(db, open_))  # unlocked control
 
 
 # 11. Move: a locked session never leaves its store, even through the owner-less move path.
