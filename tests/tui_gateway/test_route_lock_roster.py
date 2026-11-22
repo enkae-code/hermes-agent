@@ -84,3 +84,20 @@ def test_read_bot_sessions_unlocked_control_operator_sees_titles(tmp_path):
         view = _read_bot_sessions(db, 'local:other', True)
         assert view['last_session']['title'] == 'Title-open-last'
         assert view['canonical_session']['title'] == 'Bot Chat'
+
+
+@pytest.mark.parametrize(('locked', 'subject', 'operator', 'title'), [
+    (True, 'local:other', False, ''),
+    (True, 'local:other', True, ''),
+    (True, 'local:test', False, 'Worker title'),
+    (False, 'local:other', False, 'Worker title'),
+])
+def test_roster_worker_title_respects_route_lock(tmp_path, locked, subject, operator, title):
+    with SessionDB(tmp_path / 'state.db') as db:
+        sid, _ = _record(db, tmp_path, 'worker', lock=locked)
+        # Plant the worker label on a real receipt; the reader must not rely on source provenance.
+        db._write_sql("UPDATE sessions SET source='tool' WHERE id=?", (sid,))
+        db.set_session_title(sid, 'Worker title')
+        worker = _read_bot_sessions(db, subject, operator)['worker_session']
+        assert worker['id'] == sid and worker['source'] == 'tool'
+        assert worker['title'] == title

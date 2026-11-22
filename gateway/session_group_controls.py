@@ -413,12 +413,13 @@ def _read_bot_sessions(db, subject, operator):
     # One read connection for the whole row. A store closed meanwhile (its profile unserved
     # mid-poll) refuses rather than reopening a writer into a home that is being deleted.
     with db._read_ctx(reopen=False) as conn, content_sql_filter(db, conn):
+        def title(row):  # a locked row's title is content: only its own owner reads it
+            return (row['title'] or '') if same_owner(row['user_id'], subject) or conn.execute(
+                'SELECT route_content_readable(?)', (row['id'],)).fetchone()[0] else ''
+
         def summary(root):
             tip = db._compression_tip_on(conn, root['id'])
             target = conn.execute('SELECT * FROM sessions WHERE id=?', (tip,)).fetchone() or root
-            def title(row):  # a locked row's title is content: only its own owner reads it
-                return (row['title'] or '') if same_owner(row['user_id'], subject) or conn.execute(
-                    'SELECT route_content_readable(?)', (row['id'],)).fetchone()[0] else ''
             return {'id': root['id'], 'resolved_id': tip, 'title': title(target),
                     'root_title': title(root), 'preview': latest_message_preview(conn, tip),
                     'started_at': target['started_at'] or 0,
@@ -448,12 +449,12 @@ def _read_bot_sessions(db, subject, operator):
         # archived or hidden row; no owner filter -- a worker's ``user_id`` is the dispatch identity
         # (a bot, the kanban dispatcher), not this reader, and the legacy roster read it the same way.
         worker = conn.execute(
-            f"SELECT id, source, title, COALESCE(last_activity_at, started_at) AS last_active FROM sessions "
+            f"SELECT id, source, user_id, title, COALESCE(last_activity_at, started_at) AS last_active FROM sessions "
             f"WHERE COALESCE(source,'') IN ({hidden_sources}) AND archived=0 AND hidden=0 "
             "ORDER BY last_active DESC LIMIT 1", INTERNAL_LISTING_SOURCES).fetchone()
         if worker:
             fields['worker_session'] = {'id': worker['id'], 'source': (worker['source'] or '').strip().lower(),
-                                        'title': worker['title'] or '', 'last_active': worker['last_active'] or 0}
+                                        'title': title(worker), 'last_active': worker['last_active'] or 0}
     return fields
 
 
